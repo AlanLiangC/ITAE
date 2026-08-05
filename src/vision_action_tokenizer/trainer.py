@@ -12,10 +12,12 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel
+from torch.utils.tensorboard import SummaryWriter
 
 from .distributed import DistributedContext, reduce_metrics
 from .losses import TokenizerLoss
 from .metrics import trajectory_metrics
+from .visualization import render_bev_trajectory_comparison
 
 
 def _to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
@@ -71,11 +73,36 @@ class TokenizerTrainer:
         self.scaler = torch.cuda.amp.GradScaler(
             enabled=precision == "fp16" and context.device.type == "cuda"
         )
+        tensorboard_config = self.config.get("tensorboard", {})
+        self.eval_visualization_items = int(
+            tensorboard_config.get("evaluation_visualization_items", 0)
+        )
+        self.eval_visualization_every = int(
+            tensorboard_config.get("evaluation_visualization_every_epochs", 1)
+        )
+        if self.eval_visualization_items < 0:
+            raise ValueError("tensorboard.evaluation_visualization_items must be non-negative")
+        if self.eval_visualization_every <= 0:
+            raise ValueError(
+                "tensorboard.evaluation_visualization_every_epochs must be positive"
+            )
+        self.writer: SummaryWriter | None = None
         if context.is_main:
             self.output_dir.mkdir(parents=True, exist_ok=True)
             (self.output_dir / "resolved_config.json").write_text(
                 json.dumps(self.config, indent=2, ensure_ascii=False, default=str), encoding="utf-8"
             )
+            if bool(tensorboard_config.get("enabled", False)):
+                configured_log_dir = tensorboard_config.get("log_dir")
+                log_dir = (
+                    self.output_dir / "tensorboard"
+                    if configured_log_dir in (None, "")
+                    else Path(configured_log_dir)
+                )
+                self.writer = SummaryWriter(
+                    log_dir=str(log_dir),
+                    flush_secs=int(tensorboard_config.get("flush_secs", 30)),
+                )
 
     def fit(
         self,
@@ -85,21 +112,29 @@ class TokenizerTrainer:
         log_every: int = 20,
         start_epoch: int = 0,
     ) -> None:
-        for epoch in range(start_epoch, epochs):
-            sampler = getattr(train_loader, "sampler", None)
-            if hasattr(sampler, "set_epoch"):
-                sampler.set_epoch(epoch)
-            self._train_epoch(train_loader, epoch, log_every)
-            metrics = self.evaluate(val_loader)
-            if self.context.is_main:
-                self._print_metrics(f"val epoch={epoch}", metrics)
-                ade = metrics.get("metric/ade_m", torch.tensor(math.inf)).item()
-                is_best = ade < self.best_ade
-                if is_best:
-                    self.best_ade = ade
-                self.save_checkpoint("last.pt", epoch)
-                if is_best:
-                    self.save_checkpoint("best.pt", epoch)
+        try:
+            for epoch in range(start_epoch, epochs):
+                sampler = getattr(train_loader, "sampler", None)
+                if hasattr(sampler, "set_epoch"):
+                    sampler.set_epoch(epoch)
+                self._train_epoch(train_loader, epoch, log_every)
+                metrics = self.evaluate(val_loader, epoch=epoch)
+                if self.context.is_main:
+                    self._print_metrics(f"val epoch={epoch}", metrics)
+                    self._write_scalars("validation", metrics, self.global_step)
+                    if self.writer is not None:
+                        self.writer.add_scalar("progress/epoch", epoch, self.global_step)
+                    ade = metrics.get("metric/ade_m", torch.tensor(math.inf)).item()
+                    is_best = ade < self.best_ade
+                    if is_best:
+                        self.best_ade = ade
+                    self.save_checkpoint("last.pt", epoch)
+                    if is_best:
+                        self.save_checkpoint("best.pt", epoch)
+        finally:
+            if self.writer is not None:
+                self.writer.flush()
+                self.writer.close()
 
     def _autocast(self) -> Any:
         dtype = torch.bfloat16 if self.precision == "bf16" else torch.float16
@@ -135,7 +170,9 @@ class TokenizerTrainer:
                 raise FloatingPointError(f"Non-finite loss at samples {tokens}")
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), self.grad_clip_norm
+            )
             self.scaler.step(self.optimizer)
             self.scaler.update()
             if self.scheduler is not None:
@@ -143,6 +180,11 @@ class TokenizerTrainer:
             self.global_step += 1
             for key, value in terms.items():
                 running[key] += float(value)
+            if self.context.is_main:
+                step_metrics: dict[str, Any] = dict(terms)
+                step_metrics["optimization/lr"] = self.optimizer.param_groups[0]["lr"]
+                step_metrics["optimization/grad_norm"] = grad_norm.detach()
+                self._write_scalars("train", step_metrics, self.global_step)
             if self.context.is_main and (batch_index + 1) % log_every == 0:
                 averaged = {key: value / log_every for key, value in running.items()}
                 averaged["lr"] = self.optimizer.param_groups[0]["lr"]
@@ -150,10 +192,16 @@ class TokenizerTrainer:
                 running.clear()
 
     @torch.no_grad()
-    def evaluate(self, loader: Any) -> dict[str, Tensor]:
+    def evaluate(self, loader: Any, epoch: int | None = None) -> dict[str, Tensor]:
         self.model.eval()
         totals: dict[str, Tensor] = {}
         batches = 0
+        visualization_count = 0
+        render_visualizations = (
+            self.writer is not None
+            and self.eval_visualization_items > 0
+            and (epoch is None or epoch % self.eval_visualization_every == 0)
+        )
         for raw_batch in loader:
             batch = _to_device(raw_batch, self.context.device)
             with self._autocast():
@@ -182,6 +230,27 @@ class TokenizerTrainer:
                         batch["trajectory_mask"],
                     )
                 )
+            if render_visualizations and visualization_count < self.eval_visualization_items:
+                batch_size = batch["trajectory"].shape[0]
+                sample_tokens = batch.get("sample_token", [""] * batch_size)
+                for item_index in range(batch_size):
+                    if visualization_count >= self.eval_visualization_items:
+                        break
+                    image = render_bev_trajectory_comparison(
+                        batch["trajectory"][item_index],
+                        output.reconstruction_vis[item_index],
+                        output.reconstruction_traj[item_index],
+                        batch["future_times"][item_index],
+                        sample_token=str(sample_tokens[item_index]),
+                        mask=batch["trajectory_mask"][item_index],
+                    )
+                    assert self.writer is not None
+                    self.writer.add_image(
+                        f"evaluation/bev/item_{visualization_count:03d}",
+                        image,
+                        self.global_step,
+                    )
+                    visualization_count += 1
             for key, value in terms.items():
                 totals[key] = totals.get(key, torch.zeros_like(value)) + value
             batches += 1
@@ -239,3 +308,9 @@ class TokenizerTrainer:
     def _print_metrics(prefix: str, metrics: dict[str, Any]) -> None:
         rendered = " ".join(f"{key}={float(value):.5f}" for key, value in sorted(metrics.items()))
         print(f"{prefix} {rendered}", flush=True)
+
+    def _write_scalars(self, prefix: str, metrics: dict[str, Any], step: int) -> None:
+        if self.writer is None:
+            return
+        for key, value in sorted(metrics.items()):
+            self.writer.add_scalar(f"{prefix}/{key}", float(value), step)

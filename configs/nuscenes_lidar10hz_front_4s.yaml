@@ -47,7 +47,7 @@ model:
 
 loss:
   reconstruction_weight: 1.0
-  dynamics_weight: 0.25
+  dynamics_weight: 0.0 # 0.25
   physical_weight: 0.05
   kl_weight: 0.0001
   kl_free_bits: 0.05
@@ -61,6 +61,7 @@ loss:
   max_yaw_rate_rps: 1.2
 
 train:
+  resume: auto  # auto/latest | null/false | checkpoint path (e.g. last.pt)
   epochs: 30
   batch_size: 4
   learning_rate: 0.0002
@@ -71,3 +72,11 @@ train:
   log_every: 20
   validate_every: 1
   save_every: 1
+
+tensorboard:
+  enabled: true
+  log_dir: null  # null -> <training output>/tensorboard
+  flush_secs: 30
+  evaluation_visualization_items: 8
+  evaluation_visualization_every_epochs: 1
+  evaluation_visualization_distinct_scenes: true

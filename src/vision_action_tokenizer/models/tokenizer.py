@@ -108,7 +108,7 @@ class VisionActionTokenizer(nn.Module):
         trajectory_mask: Tensor | None = None,
         sample_posterior: bool = True,
     ) -> TokenizerOutput:
-        frame_tokens = self.resampler(visual_features)
+        frame_tokens = self.resampler(visual_features) # [4, 5, 32, 512]
         mean_vis, logvar_vis, _ = self.visual_encoder(frame_tokens, frame_times)
         if sample_posterior:
             latent_vis = mean_vis + torch.exp(0.5 * logvar_vis) * torch.randn_like(mean_vis)

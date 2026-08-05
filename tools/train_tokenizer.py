@@ -11,7 +11,11 @@ import torch
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler, Subset
 
-from vision_action_tokenizer.config import load_config, seed_everything
+from vision_action_tokenizer.config import (
+    load_config,
+    resolve_resume_checkpoint,
+    seed_everything,
+)
 from vision_action_tokenizer.data.dataset import CachedPEFeatureDataset, NuScenesWindowDataset
 from vision_action_tokenizer.data.manifest import manifest_scene_tokens
 from vision_action_tokenizer.distributed import cleanup_distributed, initialize_distributed
@@ -26,7 +30,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-manifest", required=True, type=Path)
     parser.add_argument("--val-manifest", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--resume", type=Path)
+    resume_group = parser.add_mutually_exclusive_group()
+    resume_group.add_argument("--resume", type=Path, help="Explicit checkpoint override")
+    resume_group.add_argument(
+        "--no-resume", action="store_true", help="Ignore config/auto-resume and start fresh"
+    )
     parser.add_argument("--overfit-samples", type=int)
     parser.add_argument("--epochs", type=int, help="Override train.epochs for smoke tests")
     parser.add_argument("--train-feature-cache", type=Path)
@@ -80,7 +88,18 @@ def main() -> None:
             "train": str(args.train_feature_cache),
             "val": str(args.val_feature_cache),
         }
+    resume_checkpoint = resolve_resume_checkpoint(
+        config,
+        args.output,
+        cli_resume=args.resume,
+        no_resume=args.no_resume,
+    )
     context = initialize_distributed()
+    if context.is_main:
+        if resume_checkpoint is None:
+            print(f"Starting fresh; no resume checkpoint selected in {args.output}", flush=True)
+        else:
+            print(f"Resuming training from {resume_checkpoint}", flush=True)
     seed_everything(int(config["seed"]) + context.rank)
     train_scenes = manifest_scene_tokens(args.train_manifest)
     val_scenes = manifest_scene_tokens(args.val_manifest)
@@ -126,6 +145,9 @@ def main() -> None:
             device_ids=[context.local_rank] if context.device.type == "cuda" else None,
         )
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    # print trainable parameters
+    total_params = sum(p.numel() for p in parameters)
+    print(f"Total trainable parameters: {total_params:,}")
     optimizer = torch.optim.AdamW(
         parameters,
         lr=float(config["train"]["learning_rate"]),
@@ -152,7 +174,7 @@ def main() -> None:
         grad_clip_norm=float(config["train"]["grad_clip_norm"]),
         config=config,
     )
-    start_epoch = trainer.load_checkpoint(args.resume) if args.resume else 0
+    start_epoch = trainer.load_checkpoint(resume_checkpoint) if resume_checkpoint else 0
     try:
         trainer.fit(
             train_loader,

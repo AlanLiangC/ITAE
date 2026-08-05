@@ -28,6 +28,52 @@ def stable_hash(value: Any) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def resolve_resume_checkpoint(
+    config: dict[str, Any],
+    output_dir: str | Path,
+    cli_resume: str | Path | None = None,
+    no_resume: bool = False,
+) -> Path | None:
+    """Resolve CLI/config/automatic checkpoint selection for training resume.
+
+    Priority is explicit CLI path, ``--no-resume``, then ``train.resume``. The
+    config value accepts ``auto``/``latest``, null/false/``none``, or a path. A
+    relative filename such as ``last.pt`` is also searched inside ``output_dir``.
+    """
+
+    output = Path(output_dir)
+    if cli_resume is not None:
+        checkpoint = Path(cli_resume)
+        if not checkpoint.is_file():
+            raise FileNotFoundError(f"Explicit --resume checkpoint does not exist: {checkpoint}")
+        return checkpoint
+    if no_resume:
+        return None
+
+    setting = config.get("train", {}).get("resume", "auto")
+    if setting is None or setting is False:
+        return None
+    if setting is True:
+        setting = "auto"
+    if not isinstance(setting, (str, Path)):
+        raise TypeError("train.resume must be auto/latest, null/false/none, or a path")
+    normalized = str(setting).strip()
+    if normalized.lower() in {"", "none", "off", "false"}:
+        return None
+    if normalized.lower() in {"auto", "latest"}:
+        candidates = [path for path in output.glob("*.pt") if path.is_file()]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda path: (path.stat().st_mtime_ns, path.name))
+
+    checkpoint = Path(normalized)
+    if not checkpoint.is_absolute() and not checkpoint.is_file():
+        checkpoint = output / checkpoint
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"Configured train.resume checkpoint does not exist: {checkpoint}")
+    return checkpoint
+
+
 def seed_everything(seed: int, deterministic: bool = False) -> None:
     """Seed Python, NumPy and PyTorch on every distributed worker."""
     random.seed(seed)

@@ -34,6 +34,7 @@ from vision_action_tokenizer.data.schema import (
     resolve_data_path,
 )
 from vision_action_tokenizer.data.temporal import TemporalIndex
+from vision_action_tokenizer.visualization import trajectory_time_color
 
 
 def parse_args() -> argparse.Namespace:
@@ -192,12 +193,7 @@ def _project_trajectory(
 
 
 def _time_color(fraction: float) -> tuple[int, int, int]:
-    fraction = min(max(fraction, 0.0), 1.0)
-    return (
-        round(30 + 225 * fraction),
-        round(245 - 190 * fraction),
-        round(110 - 65 * fraction),
-    )
+    return trajectory_time_color(fraction)
 
 
 def _draw_bev(draw: ImageDraw.ImageDraw, trajectory: np.ndarray, width: int, height: int) -> None:

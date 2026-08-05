@@ -114,7 +114,7 @@ class VisionActionTrainingModel(nn.Module):
         trajectory_mask: Tensor | None = None,
         sample_posterior: bool = True,
     ) -> Any:
-        visual_features = self.pe_extractor(images)
+        visual_features = self.pe_extractor(images) # [4, 5, 64, 768]
         return self.tokenizer(
             visual_features=visual_features,
             trajectory=trajectory,

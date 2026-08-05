@@ -1,0 +1,83 @@
+{
+  "seed": 42,
+  "data": {
+    "data_root": "data/nuscenes",
+    "image_size": 512,
+    "image_source": "keyframe",
+    "frame_offsets_s": [
+      0.0,
+      1.0,
+      2.0,
+      3.0,
+      4.0
+    ],
+    "max_image_time_error_s": 0.25,
+    "trajectory_pose_source": "lidar_sweeps",
+    "trajectory_sampling": "nearest",
+    "future_horizon_s": 4.0,
+    "trajectory_hz": 10,
+    "max_trajectory_time_error_s": 0.03,
+    "max_pose_interpolation_gap_s": 0.15,
+    "anchor_stride_s": 0.0,
+    "feature_cache": null,
+    "num_workers": 8
+  },
+  "pe": {
+    "model_name": "PE-Spatial-B16-512",
+    "checkpoint_path": "/home/alan/AlanLiang/Projects/pure_checkpoints/PE-Spatial-B16-512/PE-Spatial-B16-512.pt",
+    "feature_dim": 768,
+    "layer_idx": null,
+    "pool_size": 8,
+    "forward_batch_size": 5,
+    "freeze": true
+  },
+  "model": {
+    "model_dim": 512,
+    "latent_dim": 256,
+    "num_action_tokens": 10,
+    "resampled_tokens_per_frame": 32,
+    "num_heads": 8,
+    "encoder_layers": 4,
+    "decoder_layers": 4,
+    "dropout": 0.1,
+    "decoder_type": "kinematic",
+    "max_speed_mps": 35.0,
+    "trajectory_position_scale_m": 50.0
+  },
+  "loss": {
+    "reconstruction_weight": 1.0,
+    "dynamics_weight": 0.0,
+    "physical_weight": 0.05,
+    "kl_weight": 0.0001,
+    "kl_free_bits": 0.05,
+    "kl_warmup_steps": 10000,
+    "alignment_weight": 0.2,
+    "visual_transition_weight": 0.1,
+    "info_nce_temperature": 0.1,
+    "max_accel_mps2": 5.0,
+    "max_decel_mps2": 8.0,
+    "max_jerk_mps3": 10.0,
+    "max_yaw_rate_rps": 1.2
+  },
+  "train": {
+    "resume": "auto",
+    "epochs": 30,
+    "batch_size": 4,
+    "learning_rate": 0.0002,
+    "weight_decay": 0.01,
+    "warmup_steps": 1000,
+    "grad_clip_norm": 1.0,
+    "precision": "bf16",
+    "log_every": 20,
+    "validate_every": 1,
+    "save_every": 1
+  },
+  "tensorboard": {
+    "enabled": true,
+    "log_dir": null,
+    "flush_secs": 30,
+    "evaluation_visualization_items": 8,
+    "evaluation_visualization_every_epochs": 1,
+    "evaluation_visualization_distinct_scenes": true
+  }
+}

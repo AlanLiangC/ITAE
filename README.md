@@ -172,7 +172,42 @@ torchrun --standalone --nproc_per_node=1 tools/train_tokenizer.py \
 ```
 
 多卡时修改 `--nproc_per_node`。训练脚本支持 DDP、BF16/FP16、断点恢复、梯度裁剪和
-配置/manifest hash 记录。
+配置/manifest hash 记录。默认同时把每步训练 loss、学习率、梯度范数、每轮验证指标和
+BEV 轨迹重建对比写入 `<output>/tensorboard`：
+
+```bash
+tensorboard --logdir outputs/tokenizer_lidar10hz_4s/tensorboard --port 6006
+```
+
+默认 `train.resume: auto`：启动时扫描 `--output` 目录下的 `*.pt`，按修改时间自动恢复
+最新的完整 checkpoint（包含模型、optimizer、scheduler、scaler、epoch、global step 和
+随机数状态）。也可以在 config 中指定文件；相对文件名会在 output 目录内查找：
+
+```yaml
+train:
+  resume: auto                       # 自动选择 output 中最新 checkpoint
+  # resume: last.pt                 # output/last.pt
+  # resume: /abs/path/checkpoint.pt # 明确路径
+  # resume: null                    # 禁止自动恢复
+```
+
+命令行 `--resume /path/to/checkpoint.pt` 的优先级最高；临时强制从头训练可加
+`--no-resume`。若自动扫描的 output 目录为空，会打印提示并正常从 epoch 0 开始。
+
+验证可视化数量和频率由配置控制。每个 item 包含 GT、visual-latent reconstruction 和
+trajectory-latent reconstruction 三个共享尺度的 BEV 面板；绿→黄→红表示窗口内时间由近
+到远，重建面板中的灰色虚线是 GT。默认从不同 scene 各取一个固定 item，避免连续窗口
+重复，并确保不同 epoch 可在同一 TensorBoard image tag 下比较：
+
+```yaml
+tensorboard:
+  enabled: true
+  log_dir: null
+  flush_secs: 30
+  evaluation_visualization_items: 8
+  evaluation_visualization_every_epochs: 1
+  evaluation_visualization_distinct_scenes: true
+```
 
 建议按以下顺序验证：
 
@@ -190,6 +225,9 @@ python tools/evaluate_tokenizer.py \
   --checkpoint outputs/tokenizer/best.pt \
   --output outputs/tokenizer/val_metrics.json
 ```
+
+独立 evaluation 同样会把 scalar 和 BEV item 写到输出 JSON 同级的 `tensorboard_eval/`；
+可用 `--tensorboard-dir <path>` 与 `--visualize-items <N>` 覆盖目录和抽样数量。
 
 ## 5. PE 特征缓存
 
