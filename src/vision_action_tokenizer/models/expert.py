@@ -119,5 +119,7 @@ class GaussianLatentDiffusion(nn.Module):
                 latent = predicted_clean
                 break
             next_alpha = self.alphas_cumulative[schedule[index + 1]]
-            latent = next_alpha.sqrt() * predicted_clean + (1.0 - next_alpha).sqrt() * predicted_noise
+            latent = (
+                next_alpha.sqrt() * predicted_clean + (1.0 - next_alpha).sqrt() * predicted_noise
+            )
         return latent

@@ -13,4 +13,3 @@ __all__ = [
     "VisionActionTokenizer",
     "VisualTransitionEncoder",
 ]
-

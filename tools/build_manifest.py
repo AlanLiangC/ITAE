@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build timestamp-checked 6-frame/60-point training windows."""
+"""Build config-driven, timestamp-checked nuScenes training windows."""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ import argparse
 import json
 from pathlib import Path
 
+from vision_action_tokenizer.config import load_config
+from vision_action_tokenizer.data.lidar import load_lidar_pose_records
 from vision_action_tokenizer.data.manifest import ManifestBuilder, save_manifest
 from vision_action_tokenizer.data.schema import (
     InfoSchemaAdapter,
@@ -17,30 +19,32 @@ from vision_action_tokenizer.data.schema import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--info", required=True, type=Path)
-    parser.add_argument("--data-root", required=True, type=Path)
+    parser.add_argument("--data-root", type=Path, help="Optional override for config data_root")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--report", required=True, type=Path)
-    parser.add_argument("--max-time-error", type=float, default=0.055)
-    parser.add_argument("--anchor-stride", type=float, default=0.5)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    config = load_config(args.config)
+    data_root = args.data_root or Path(config["data"]["data_root"])
     _, entries = load_info_pickle(args.info)
     records = InfoSchemaAdapter().adapt(
-        entries, scene_lookup=load_nuscenes_scene_lookup(args.data_root)
+        entries, scene_lookup=load_nuscenes_scene_lookup(data_root)
     )
-    builder = ManifestBuilder(
-        args.data_root,
-        frame_offsets_s=[0, 1, 2, 3, 4, 5],
-        horizon_s=5.0,
-        trajectory_hz=12,
-        anchor_stride_s=args.anchor_stride,
-        max_time_error_s=args.max_time_error,
-    )
-    windows, report = builder.build(records)
+    builder = ManifestBuilder.from_config(config, data_root=data_root)
+    lidar_records = None
+    lidar_report = None
+    if builder.trajectory_pose_source == "lidar_sweeps":
+        lidar_records, lidar_report = load_lidar_pose_records(
+            data_root, {record.scene_token for record in records}
+        )
+    windows, report = builder.build(records, lidar_pose_records=lidar_records)
+    if lidar_report is not None:
+        report["lidar_pose_source"] = lidar_report
     save_manifest(windows, args.output)
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")

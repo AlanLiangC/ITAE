@@ -64,4 +64,3 @@ def test_full_tokenizer_loss_backward() -> None:
     assert torch.isfinite(loss)
     assert "loss/alignment" in terms
     assert tokenizer.visual_encoder.to_mean.weight.grad is not None
-

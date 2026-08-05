@@ -37,8 +37,10 @@ def build_training_model(config: dict[str, Any], cached: bool = False) -> nn.Mod
     pe_config = config["pe"]
     extractor = PEFeatureExtractor(
         model_name=str(pe_config["model_name"]),
+        checkpoint_path=pe_config.get("checkpoint_path"),
         layer_idx=pe_config.get("layer_idx"),
         pool_size=int(pe_config["pool_size"]),
+        forward_batch_size=pe_config.get("forward_batch_size"),
         freeze=bool(pe_config.get("freeze", True)),
     )
     return VisionActionTrainingModel(extractor, tokenizer)
@@ -49,7 +51,9 @@ def tokenizer_state_from_checkpoint(checkpoint: dict[str, Any]) -> dict[str, Any
     state = checkpoint["model"] if "model" in checkpoint else checkpoint
     prefixes = ("tokenizer.", "module.tokenizer.")
     for prefix in prefixes:
-        selected = {key[len(prefix) :]: value for key, value in state.items() if key.startswith(prefix)}
+        selected = {
+            key[len(prefix) :]: value for key, value in state.items() if key.startswith(prefix)
+        }
         if selected:
             return selected
     return state

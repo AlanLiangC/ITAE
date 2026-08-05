@@ -61,4 +61,3 @@ def make_transformer_encoder(
         norm_first=True,
     )
     return nn.TransformerEncoder(layer, num_layers=num_layers, norm=nn.LayerNorm(dim))
-

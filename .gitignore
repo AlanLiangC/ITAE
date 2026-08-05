@@ -12,5 +12,4 @@ data/action_latents/
 *.pt
 *.pth
 *.safetensors
-data
-
+data/nuscenes

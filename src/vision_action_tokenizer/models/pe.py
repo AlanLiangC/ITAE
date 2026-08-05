@@ -21,23 +21,31 @@ class PEFeatureExtractor(nn.Module):
     def __init__(
         self,
         model_name: str = "PE-Spatial-B16-512",
+        checkpoint_path: str | None = None,
         layer_idx: int | None = None,
         pool_size: int = 8,
+        forward_batch_size: int | None = None,
         freeze: bool = True,
         model: nn.Module | None = None,
     ) -> None:
         super().__init__()
         self.model_name = model_name
+        self.checkpoint_path = checkpoint_path
         self.layer_idx = layer_idx
         self.pool_size = pool_size
+        if forward_batch_size is not None and forward_batch_size <= 0:
+            raise ValueError("forward_batch_size must be positive when provided")
+        self.forward_batch_size = forward_batch_size
         self.freeze = freeze
-        self.model = model if model is not None else self._load_official_model(model_name)
+        self.model = (
+            model if model is not None else self._load_official_model(model_name, checkpoint_path)
+        )
         if freeze:
             self.model.requires_grad_(False)
             self.model.eval()
 
     @staticmethod
-    def _load_official_model(model_name: str) -> nn.Module:
+    def _load_official_model(model_name: str, checkpoint_path: str | None) -> nn.Module:
         try:
             import core.vision_encoder.pe as pe  # type: ignore[import-not-found]
         except ImportError as error:
@@ -45,9 +53,11 @@ class PEFeatureExtractor(nn.Module):
                 "Meta perception_models is not installed. Follow README section 2 or inject "
                 "a compatible PE model when testing."
             ) from error
-        return pe.VisionTransformer.from_config(model_name, pretrained=True)
+        return pe.VisionTransformer.from_config(
+            model_name, pretrained=True, checkpoint_path=checkpoint_path
+        )
 
-    def train(self, mode: bool = True) -> "PEFeatureExtractor":
+    def train(self, mode: bool = True) -> PEFeatureExtractor:
         super().train(mode)
         if self.freeze:
             self.model.eval()
@@ -63,7 +73,14 @@ class PEFeatureExtractor(nn.Module):
             kwargs: dict[str, Any] = {"strip_cls_token": True}
             if self.layer_idx is not None:
                 kwargs["layer_idx"] = self.layer_idx
-            features = self.model.forward_features(flattened, **kwargs)
+            chunks = (
+                flattened.split(self.forward_batch_size)
+                if self.forward_batch_size is not None
+                else (flattened,)
+            )
+            features = torch.cat(
+                [self.model.forward_features(chunk, **kwargs) for chunk in chunks], dim=0
+            )
         if features.ndim != 3:
             raise ValueError(f"PE forward_features must return [BF,P,C], got {features.shape}")
         features = self._spatial_pool(features)

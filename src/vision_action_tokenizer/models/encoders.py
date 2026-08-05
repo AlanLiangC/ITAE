@@ -65,13 +65,11 @@ class VisualTransitionEncoder(nn.Module):
         transition = self.transition_encoder(transition)
 
         horizon = frame_times[:, -1:].clamp_min(1e-3)
-        fractions = (torch.arange(self.num_action_tokens, device=frame_times.device) + 0.5)
+        fractions = torch.arange(self.num_action_tokens, device=frame_times.device) + 0.5
         fractions = fractions.to(frame_times.dtype) / self.num_action_tokens
         centers = horizon * fractions.unsqueeze(0)
         queries = self.action_queries.unsqueeze(0).expand(batch, -1, -1)
-        queries = queries + self.time_projection(
-            sinusoidal_time_embedding(centers, self.model_dim)
-        )
+        queries = queries + self.time_projection(sinusoidal_time_embedding(centers, self.model_dim))
         posterior, _ = self.action_attention(queries, transition, transition, need_weights=False)
         posterior = self.posterior_norm(posterior)
         mean = self.to_mean(posterior)
@@ -128,13 +126,11 @@ class TrajectoryEncoder(nn.Module):
 
         batch = trajectory.shape[0]
         horizon = future_times[:, -1:].clamp_min(1e-3)
-        fractions = (torch.arange(self.num_action_tokens, device=trajectory.device) + 0.5)
+        fractions = torch.arange(self.num_action_tokens, device=trajectory.device) + 0.5
         fractions = fractions.to(trajectory.dtype) / self.num_action_tokens
         centers = horizon * fractions.unsqueeze(0)
         queries = self.queries.unsqueeze(0).expand(batch, -1, -1)
-        queries = queries + self.time_projection(
-            sinusoidal_time_embedding(centers, self.model_dim)
-        )
+        queries = queries + self.time_projection(sinusoidal_time_embedding(centers, self.model_dim))
         latent, _ = self.query_attention(
             queries, memory, memory, key_padding_mask=padding_mask, need_weights=False
         )

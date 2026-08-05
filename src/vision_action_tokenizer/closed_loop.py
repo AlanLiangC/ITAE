@@ -131,7 +131,12 @@ class RecedingHorizonReplayBackend(_BaseReplayBackend):
         predicted_global = compose_se2(previous_logged, plan[point_index])
         position_error = float(np.linalg.norm(predicted_global[:2] - logged_next[:2]))
         yaw_error = float(
-            abs(np.arctan2(np.sin(predicted_global[2] - logged_next[2]), np.cos(predicted_global[2] - logged_next[2])))
+            abs(
+                np.arctan2(
+                    np.sin(predicted_global[2] - logged_next[2]),
+                    np.cos(predicted_global[2] - logged_next[2]),
+                )
+            )
         )
         # L0 intentionally snaps ego back to the log. This is why it is pseudo closed-loop.
         self.current_state = logged_next.copy()
@@ -160,7 +165,12 @@ class KinematicReplayBackend(_BaseReplayBackend):
         logged = self.scenario.ego_states_xyyaw[self.index]
         position_error = float(np.linalg.norm(self.current_state[:2] - logged[:2]))
         yaw_error = float(
-            abs(np.arctan2(np.sin(self.current_state[2] - logged[2]), np.cos(self.current_state[2] - logged[2])))
+            abs(
+                np.arctan2(
+                    np.sin(self.current_state[2] - logged[2]),
+                    np.cos(self.current_state[2] - logged[2]),
+                )
+            )
         )
         collision = self._collision()
         self.errors.append(position_error)
@@ -174,4 +184,3 @@ class KinematicReplayBackend(_BaseReplayBackend):
             collision,
             self.index == len(self.scenario.timestamps_s) - 1,
         )
-

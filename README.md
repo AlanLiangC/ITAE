@@ -1,7 +1,8 @@
 # Vision-Aligned Action Tokenizer
 
-面向端到端自动驾驶 action expert 的视觉对齐连续动作 tokenizer。项目把未来 5 s 的
-`[60, 3] = [x, y, yaw]` 自车轨迹编码为 `[10, 256]` action tokens，并让 latent 同时满足：
+面向端到端自动驾驶 action expert 的视觉对齐连续动作 tokenizer。默认配置把 4 s 输入
+视觉窗口内 `(t0, t0+4s]` 的 `[40, 3] = [x, y, yaw]` 自车轨迹编码为 `[10, 256]`
+action tokens，并让 latent 同时满足：
 
 - 可从当前到未来的 PE-Spatial 视觉状态转移中提取；
 - 可由纯轨迹编码器得到，并与视觉 latent 对齐；
@@ -11,7 +12,8 @@
 当前版本包括：
 
 - MMDetection3D 新旧格式及自定义 12 Hz nuScenes info 适配；
-- 6 帧 `[0, 1, 2, 3, 4, 5] s` 视觉窗口与 60 点、12 Hz 轨迹构建；
+- 5 帧官方 CAM_FRONT keyframe `[0, 1, 2, 3, 4] s` 视觉窗口；
+- 官方 `LIDAR_TOP sample_data -> ego_pose` 构建的 40 点、10 Hz 实测轨迹；
 - `PE-Spatial-B16-512` patch-token 提取与离线缓存；
 - 视觉转移 CVAE、轨迹编码器、共享无上下文 decoder；
 - direct 和可微 unicycle 两种 trajectory head；
@@ -25,7 +27,7 @@
 Tokenizer 训练：
 
 ```text
-6 images -> frozen PE -> visual transition encoder -> z_vis --+
+5 images -> frozen PE -> visual transition encoder -> z_vis --+
                                                               +-> shared Decoder(z) -> trajectory
 GT trajectory -----------> trajectory encoder -> z_traj -----+
                                       z_vis <-> z_traj alignment
@@ -35,7 +37,7 @@ Action expert 推理：
 
 ```text
 current/history condition tokens -> latent diffusion expert -> z_hat
-z_hat -> frozen Decoder -> [60, 3] trajectory
+z_hat -> frozen Decoder -> [40, 3] trajectory
 ```
 
 未来图像只用于 tokenizer teacher 的训练和离线 latent target 导出。部署时 decoder 不读取
@@ -58,6 +60,18 @@ pip install -e third_party/perception_models
 ```
 
 首次运行 PE 时会按官方逻辑下载 checkpoint；也可以通过环境已有的 Hugging Face 缓存读取。
+本地权重可直接写入配置，不会再次联网下载：
+
+```yaml
+pe:
+  model_name: PE-Spatial-B16-512
+  checkpoint_path: /path/to/PE-Spatial-B16-512.pt
+  forward_batch_size: 6
+```
+
+`forward_batch_size` 是 PE 内部的图像分块大小，不改变训练 batch；8 GB 显卡建议从 6
+开始。本项目的 PE 预处理使用官方 `mean=std=[0.5, 0.5, 0.5]`，同时按项目设计采用
+letterbox 保留前视相机完整横向视野。
 
 ## 3. 数据准备
 
@@ -83,20 +97,44 @@ pose 解析情况。只加载可信来源的 pickle 文件。
 
 ```bash
 python tools/build_manifest.py \
+  --config configs/nuscenes_lidar10hz_front_4s.yaml \
   --info /path/to/nuscenes_interp_12Hz_infos_train.pkl \
-  --data-root /path/to/nuscenes \
   --output data/manifests/train.jsonl \
   --report data/manifests/train_report.json
 ```
 
 默认定义：
 
-- teacher images：`t0 + [0, 1, 2, 3, 4, 5] s`；
-- trajectory：`t0 + [1/12, ..., 60/12] s`；
-- anchor stride：0.5 s；
+- teacher images：5 张官方 CAM_FRONT keyframe，目标时间为 `t0 + [0,1,2,3,4] s`；
+- trajectory：从官方 LiDAR keyframe+sweeps 最近邻抽取视觉窗口内
+  `t0 + [0.1,...,4.0] s`，共 40 点；`t0` 恒为局部坐标原点，故不重复保存；
+- anchor stride：默认使用每个官方 keyframe，可通过 `anchor_stride_s` 降采样；
 - 坐标系：anchor ego frame，`x` 向前、`y` 向左、yaw 逆时针为正。
 
-时间匹配使用真实时间戳的 nearest lookup，不依赖列表严格等间隔。窗口不会跨 scene。
+两个时间轴相互独立：图像只从 pkl 中 32 位官方 token 对应的 keyframe 选择；轨迹不再
+使用 12 Hz pkl 的插值 pose，而是流式读取官方 nuScenes 的 `sample_data.json`、
+`ego_pose.json` 和 `calibrated_sensor.json`。默认 `trajectory_sampling: nearest` 直接使用
+LiDAR 实测 ego pose，不做 SE(3) 插值。轨迹中的每个 `future_times_s` 保存实际 sweep
+时间；所有导数都使用这个真实时间。实测当前数据的 LIDAR_TOP 原始间隔约 49.8 ms
+（约 20 Hz），默认配置按 10 Hz 目标时间抽取 40 点。
+
+注意：`ego_pose` 定义车辆位姿，`calibrated_sensor` 定义 LiDAR 到 ego 的固定外参；两者
+都会解析并校验，但自车轨迹应由 `ego_pose` 构造，不能把 `sensor2ego` 误当成车辆运动。
+以下数据设置全部可在 YAML 中修改：
+
+```yaml
+data:
+  image_source: keyframe
+  frame_offsets_s: [0, 1, 2, 3, 4]
+  max_image_time_error_s: 0.25
+  trajectory_pose_source: lidar_sweeps
+  trajectory_sampling: nearest
+  future_horizon_s: 4.0
+  trajectory_hz: 10
+  max_trajectory_time_error_s: 0.03
+  max_pose_interpolation_gap_s: 0.15
+  anchor_stride_s: 0.0
+```
 
 ### 3.3 抽查样本
 
@@ -107,15 +145,27 @@ python tools/visualize_samples.py \
   --count 4
 ```
 
-正式训练前应人工检查图像顺序、轨迹朝向和 5 s 覆盖。
+正式训练前应人工检查图像顺序、轨迹朝向和 4 s 覆盖。
+
+也可以生成连续 CAM_FRONT 视频，把每一帧的 4 s / 40 点 LiDAR GT 轨迹直接投影到主视图：
+
+```bash
+python tools/visualize_trajectory_video.py \
+  --config configs/nuscenes_lidar10hz_front_4s.yaml \
+  --info data/nuscenes/nuscenes_interp_12Hz_infos_val.pkl \
+  --output outputs/trajectory_projection/val_lidar10hz_4s.mp4
+```
+
+视频左下角颜色由近到远，右下角同时显示 `x 向前、y 向左` 的 BEV。配套 JSON 会记录
+LiDAR pose 最近邻距离、可见投影点数量以及 local/global 两条解析路径的一致性误差。
 
 ## 4. 训练 tokenizer
 
-配置文件位于 `configs/nuscenes_12hz_front_5s.yaml`。最小训练命令：
+默认配置位于 `configs/nuscenes_lidar10hz_front_4s.yaml`。最小训练命令：
 
 ```bash
 torchrun --standalone --nproc_per_node=1 tools/train_tokenizer.py \
-  --config configs/nuscenes_12hz_front_5s.yaml \
+  --config configs/nuscenes_lidar10hz_front_4s.yaml \
   --train-manifest data/manifests/train.jsonl \
   --val-manifest data/manifests/val.jsonl \
   --output outputs/tokenizer
@@ -135,7 +185,7 @@ torchrun --standalone --nproc_per_node=1 tools/train_tokenizer.py \
 
 ```bash
 python tools/evaluate_tokenizer.py \
-  --config configs/nuscenes_12hz_front_5s.yaml \
+  --config configs/nuscenes_lidar10hz_front_4s.yaml \
   --manifest data/manifests/val.jsonl \
   --checkpoint outputs/tokenizer/best.pt \
   --output outputs/tokenizer/val_metrics.json
@@ -147,7 +197,7 @@ PE 冻结时可离线缓存 patch tokens：
 
 ```bash
 python tools/cache_pe_features.py \
-  --config configs/nuscenes_12hz_front_5s.yaml \
+  --config configs/nuscenes_lidar10hz_front_4s.yaml \
   --manifest data/manifests/train.jsonl \
   --output data/pe_cache/train \
   --shard-size 128
@@ -167,7 +217,7 @@ data:
 
 ```bash
 python tools/export_action_latents.py \
-  --config configs/nuscenes_12hz_front_5s.yaml \
+  --config configs/nuscenes_lidar10hz_front_4s.yaml \
   --manifest data/manifests/train.jsonl \
   --checkpoint outputs/tokenizer/best.pt \
   --output data/action_latents/train.safetensors
@@ -198,10 +248,10 @@ ruff check src tools tests
 ```python
 # 视觉 teacher，仅在 tokenizer 训练/target 导出时使用。
 out = tokenizer(
-    visual_features=pe_tokens,       # [B, 6, N, C_pe]
-    trajectory=trajectory,           # [B, 60, 3]
-    frame_times=frame_times,         # [B, 6]
-    future_times=future_times,       # [B, 60]
+    visual_features=pe_tokens,       # [B, 5, N, C_pe]
+    trajectory=trajectory,           # [B, 40, 3]
+    frame_times=frame_times,         # [B, 5]
+    future_times=future_times,       # [B, 40]
 )
 
 # 部署：decoder 不需要当前 PE context。

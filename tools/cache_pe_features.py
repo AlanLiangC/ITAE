@@ -40,8 +40,10 @@ def main() -> None:
     pe_config = config["pe"]
     extractor = PEFeatureExtractor(
         model_name=pe_config["model_name"],
+        checkpoint_path=pe_config.get("checkpoint_path"),
         layer_idx=pe_config.get("layer_idx"),
         pool_size=int(pe_config["pool_size"]),
+        forward_batch_size=pe_config.get("forward_batch_size"),
         freeze=True,
     ).to(device)
     args.output.mkdir(parents=True, exist_ok=True)
@@ -62,6 +64,7 @@ def main() -> None:
             args.output / filename,
             metadata={
                 "model_name": str(pe_config["model_name"]),
+                "checkpoint_path": str(pe_config.get("checkpoint_path")),
                 "layer_idx": str(pe_config.get("layer_idx")),
                 "pool_size": str(pe_config["pool_size"]),
             },
@@ -70,7 +73,10 @@ def main() -> None:
         shard_index += 1
         pending = []
 
-    with torch.inference_mode():
+    with (
+        torch.inference_mode(),
+        torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"),
+    ):
         for batch in loader:
             features = extractor(batch["images"].to(device, non_blocking=True)).half().cpu()
             for sample in features:
@@ -83,6 +89,7 @@ def main() -> None:
         "num_samples": count,
         "manifest_sha256": file_sha256(args.manifest),
         "model_name": pe_config["model_name"],
+        "checkpoint_path": pe_config.get("checkpoint_path"),
         "layer_idx": pe_config.get("layer_idx"),
         "pool_size": pe_config["pool_size"],
         "shards": shards,
@@ -94,4 +101,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

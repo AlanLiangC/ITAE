@@ -1,0 +1,62 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "ITAE: Debug LiDAR trajectory manifest (val)",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/alan/miniconda3/envs/openmmlab/bin/python",
+            "program": "${workspaceFolder}/tools/build_manifest.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "--config",
+                "${workspaceFolder}/configs/nuscenes_lidar10hz_front_4s.yaml",
+                "--info",
+                "${workspaceFolder}/data/nuscenes/nuscenes_interp_12Hz_infos_val.pkl",
+                "--output",
+                "/tmp/itae_debug_lidar10hz_val.jsonl",
+                "--report",
+                "/tmp/itae_debug_lidar10hz_val.report.json"
+            ],
+            "env": {
+                "PYTHONUNBUFFERED": "1"
+            }
+        },
+        {
+            "name": "ITAE: Debug tokenizer training",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/alan/miniconda3/envs/openmmlab/bin/python",
+            "program": "${workspaceFolder}/tools/train_tokenizer.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": [
+                "--config",
+                "${workspaceFolder}/configs/nuscenes_lidar10hz_front_4s.yaml",
+                "--train-manifest",
+                "${workspaceFolder}/data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl",
+                "--val-manifest",
+                "${workspaceFolder}/data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl",
+                "--output",
+                "./output/itae_debug_tokenizer",
+            ],
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:128"
+            }
+        },
+        {
+            "name": "Python Debugger: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/alan/miniconda3/envs/openmmlab/bin/python",
+            "program": "${file}",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false
+        }
+    ]
+}

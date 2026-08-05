@@ -28,4 +28,3 @@ def test_l0_and_l1_straight_rollout() -> None:
         assert result.position_error_m < 1e-9
         assert not result.collision
         assert backend.get_metrics()["steps"] == 1
-

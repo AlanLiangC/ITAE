@@ -30,7 +30,7 @@ def main() -> None:
                 axes[row, column].imshow(image)
             axes[row, column].set_title(f"t={time_s:.1f}s")
             axes[row, column].axis("off")
-        xy = list(zip(*[(point[0], point[1]) for point in window.trajectory], strict=False))
+        xy = list(zip(*[(point[0], point[1]) for point in window.trajectory]))
         axes[row, 6].plot(xy[1], xy[0])
         axes[row, 6].scatter([0], [0], marker="x")
         axes[row, 6].set_xlabel("y left [m]")
@@ -44,4 +44,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

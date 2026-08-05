@@ -24,24 +24,31 @@ def main() -> None:
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--feature-cache", type=Path)
     parser.add_argument("--batch-size", type=int, default=8)
     args = parser.parse_args()
     config = load_config(args.config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cache_config = config["data"].get("feature_cache")
-    cache = cache_config.get("train") if isinstance(cache_config, dict) else cache_config
+    configured_cache = cache_config.get("train") if isinstance(cache_config, dict) else cache_config
+    cache = args.feature_cache or configured_cache
     base = NuScenesWindowDataset(
         args.manifest, int(config["data"]["image_size"]), load_images=cache is None
     )
-    dataset = base if cache is None else CachedPEFeatureDataset(
-        base,
-        cache,
-        manifest_path=args.manifest,
-        expected_metadata={
-            "model_name": config["pe"]["model_name"],
-            "layer_idx": config["pe"].get("layer_idx"),
-            "pool_size": config["pe"]["pool_size"],
-        },
+    dataset = (
+        base
+        if cache is None
+        else CachedPEFeatureDataset(
+            base,
+            cache,
+            manifest_path=args.manifest,
+            expected_metadata={
+                "model_name": config["pe"]["model_name"],
+                "checkpoint_path": config["pe"].get("checkpoint_path"),
+                "layer_idx": config["pe"].get("layer_idx"),
+                "pool_size": config["pe"]["pool_size"],
+            },
+        )
     )
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
     tokenizer = build_tokenizer(config).to(device)
@@ -52,7 +59,12 @@ def main() -> None:
     if cache is None:
         pe = config["pe"]
         extractor = PEFeatureExtractor(
-            pe["model_name"], pe.get("layer_idx"), int(pe["pool_size"]), freeze=True
+            model_name=pe["model_name"],
+            checkpoint_path=pe.get("checkpoint_path"),
+            layer_idx=pe.get("layer_idx"),
+            pool_size=int(pe["pool_size"]),
+            forward_batch_size=pe.get("forward_batch_size"),
+            freeze=True,
         ).to(device)
 
     latents = []
@@ -60,7 +72,7 @@ def main() -> None:
     with torch.inference_mode():
         for batch in loader:
             if extractor is None:
-                features = batch["visual_features"].to(device)
+                features = batch["visual_features"].to(device).float()
             else:
                 features = extractor(batch["images"].to(device))
             output = tokenizer(

@@ -29,6 +29,17 @@ def _unwrap(model: nn.Module) -> nn.Module:
     return model.module if isinstance(model, DistributedDataParallel) else model
 
 
+def _checkpoint_model_state(model: nn.Module) -> dict[str, Tensor]:
+    """Exclude a frozen PE backbone that is already identified by config/checkpoint path."""
+    state = model.state_dict()
+    pe_extractor = getattr(model, "pe_extractor", None)
+    if pe_extractor is not None and getattr(pe_extractor, "freeze", False):
+        state = {
+            key: value for key, value in state.items() if not key.startswith("pe_extractor.model.")
+        }
+    return state
+
+
 class TokenizerTrainer:
     """Train the online-PE + tokenizer model and log auditable scalar terms."""
 
@@ -57,8 +68,8 @@ class TokenizerTrainer:
         self.config = config or {}
         self.global_step = 0
         self.best_ade = math.inf
-        self.scaler = torch.amp.GradScaler(
-            "cuda", enabled=precision == "fp16" and context.device.type == "cuda"
+        self.scaler = torch.cuda.amp.GradScaler(
+            enabled=precision == "fp16" and context.device.type == "cuda"
         )
         if context.is_main:
             self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -66,8 +77,15 @@ class TokenizerTrainer:
                 json.dumps(self.config, indent=2, ensure_ascii=False, default=str), encoding="utf-8"
             )
 
-    def fit(self, train_loader: Any, val_loader: Any, epochs: int, log_every: int = 20) -> None:
-        for epoch in range(epochs):
+    def fit(
+        self,
+        train_loader: Any,
+        val_loader: Any,
+        epochs: int,
+        log_every: int = 20,
+        start_epoch: int = 0,
+    ) -> None:
+        for epoch in range(start_epoch, epochs):
             sampler = getattr(train_loader, "sampler", None)
             if hasattr(sampler, "set_epoch"):
                 sampler.set_epoch(epoch)
@@ -76,9 +94,11 @@ class TokenizerTrainer:
             if self.context.is_main:
                 self._print_metrics(f"val epoch={epoch}", metrics)
                 ade = metrics.get("metric/ade_m", torch.tensor(math.inf)).item()
-                self.save_checkpoint("last.pt", epoch)
-                if ade < self.best_ade:
+                is_best = ade < self.best_ade
+                if is_best:
                     self.best_ade = ade
+                self.save_checkpoint("last.pt", epoch)
+                if is_best:
                     self.save_checkpoint("best.pt", epoch)
 
     def _autocast(self) -> Any:
@@ -126,9 +146,7 @@ class TokenizerTrainer:
             if self.context.is_main and (batch_index + 1) % log_every == 0:
                 averaged = {key: value / log_every for key, value in running.items()}
                 averaged["lr"] = self.optimizer.param_groups[0]["lr"]
-                self._print_metrics(
-                    f"train epoch={epoch} step={self.global_step}", averaged
-                )
+                self._print_metrics(f"train epoch={epoch} step={self.global_step}", averaged)
                 running.clear()
 
     @torch.no_grad()
@@ -176,7 +194,7 @@ class TokenizerTrainer:
         """Atomically save enough state for a strict training resume."""
         model = _unwrap(self.model)
         payload = {
-            "model": model.state_dict(),
+            "model": _checkpoint_model_state(model),
             "optimizer": self.optimizer.state_dict(),
             "scheduler": None if self.scheduler is None else self.scheduler.state_dict(),
             "scaler": self.scaler.state_dict(),
@@ -194,7 +212,16 @@ class TokenizerTrainer:
 
     def load_checkpoint(self, path: str | Path, weights_only: bool = False) -> int:
         checkpoint = torch.load(path, map_location=self.context.device, weights_only=False)
-        _unwrap(self.model).load_state_dict(checkpoint["model"], strict=True)
+        model = _unwrap(self.model)
+        incompatible = model.load_state_dict(checkpoint["model"], strict=False)
+        invalid_missing = [
+            key for key in incompatible.missing_keys if not key.startswith("pe_extractor.model.")
+        ]
+        if invalid_missing or incompatible.unexpected_keys:
+            raise RuntimeError(
+                "Checkpoint model mismatch: "
+                f"missing={invalid_missing}, unexpected={incompatible.unexpected_keys}"
+            )
         if weights_only:
             return 0
         self.optimizer.load_state_dict(checkpoint["optimizer"])
@@ -203,14 +230,12 @@ class TokenizerTrainer:
         self.scaler.load_state_dict(checkpoint["scaler"])
         self.global_step = int(checkpoint["global_step"])
         self.best_ade = float(checkpoint["best_ade"])
-        torch.set_rng_state(checkpoint["torch_rng_state"])
+        torch.set_rng_state(checkpoint["torch_rng_state"].cpu())
         if torch.cuda.is_available() and checkpoint["cuda_rng_state"] is not None:
-            torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state"])
+            torch.cuda.set_rng_state_all([state.cpu() for state in checkpoint["cuda_rng_state"]])
         return int(checkpoint["epoch"]) + 1
 
     @staticmethod
     def _print_metrics(prefix: str, metrics: dict[str, Any]) -> None:
-        rendered = " ".join(
-            f"{key}={float(value):.5f}" for key, value in sorted(metrics.items())
-        )
+        rendered = " ".join(f"{key}={float(value):.5f}" for key, value in sorted(metrics.items()))
         print(f"{prefix} {rendered}", flush=True)

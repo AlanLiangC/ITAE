@@ -3,11 +3,23 @@ seed: 42
 data:
   data_root: data/nuscenes
   image_size: 512
-  frame_offsets_s: [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
-  future_horizon_s: 5.0
-  trajectory_hz: 12
-  anchor_stride_s: 0.5
-  max_time_error_s: 0.055
+
+  # Five official CAM_FRONT keyframes at 1 Hz: t = 0, 1, 2, 3, 4 seconds.
+  image_source: keyframe  # keyframe | all
+  frame_offsets_s: [0.0, 1.0, 2.0, 3.0, 4.0]
+  # Official keyframe spacing varies around 0.5 s; 0.25 s is the nearest-keyframe bound.
+  max_image_time_error_s: 0.25
+
+  # 40 LiDAR ego poses inside the visual window: (t0, t0+4s], excluding trivial t0.
+  trajectory_pose_source: lidar_sweeps  # lidar_sweeps | frame_keyframes
+  trajectory_sampling: nearest  # nearest | interpolate
+  future_horizon_s: 4.0
+  trajectory_hz: 10
+  max_trajectory_time_error_s: 0.03
+  max_pose_interpolation_gap_s: 0.15  # used only when sampling=interpolate
+
+  # Candidate anchors are official LiDAR/camera keyframes; stride is configurable.
+  anchor_stride_s: 0.0  # 0 means use every official keyframe as a candidate anchor
   feature_cache: null
   num_workers: 8
 
@@ -17,7 +29,7 @@ pe:
   feature_dim: 768
   layer_idx: null
   pool_size: 8
-  forward_batch_size: 6  # one temporal window per frozen PE chunk on 8 GB GPUs
+  forward_batch_size: 5
   freeze: true
 
 model:
@@ -29,7 +41,7 @@ model:
   encoder_layers: 4
   decoder_layers: 4
   dropout: 0.1
-  decoder_type: kinematic  # kinematic | direct
+  decoder_type: kinematic
   max_speed_mps: 35.0
   trajectory_position_scale_m: 50.0
 
@@ -55,7 +67,7 @@ train:
   weight_decay: 0.01
   warmup_steps: 1000
   grad_clip_norm: 1.0
-  precision: bf16  # fp32 | fp16 | bf16
+  precision: bf16
   log_every: 20
   validate_every: 1
   save_every: 1

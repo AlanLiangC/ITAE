@@ -30,4 +30,3 @@ def trajectory_metrics(
         error = (predicted_dynamics[key] - target_dynamics[key]).abs()
         metrics[f"metric/{key}_mae"] = (error * valid).sum() / valid.sum().clamp_min(1)
     return metrics
-

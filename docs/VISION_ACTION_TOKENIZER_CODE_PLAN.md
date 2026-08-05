@@ -1,7 +1,7 @@
 # Vision-Aligned Action Tokenizer：工程与实验计划
 
-> 状态：设计确认稿 v0.2（五项关键设计已确认）  
-> 首个验证数据集：nuScenes，前视相机，5 s 规划时域  
+> 状态：实现稿 v0.3（LiDAR sweep 轨迹设置）
+> 首个验证数据集：nuScenes，前视相机，4 s 规划时域
 > 核心目标：将未来轨迹从手工的 `[T, 3]` 数值空间映射到由视觉状态转移监督的连续 action-token 空间，并令 diffusion/flow action expert 在该空间内生成动作。
 
 ---
@@ -11,7 +11,7 @@
 当前 action expert 直接对未来轨迹
 
 \[
-\mathbf A = \{(x_t,y_t,\psi_t)\}_{t=1}^{60}\in\mathbb R^{60\times3}
+\mathbf A = \{(x_t,y_t,\psi_t)\}_{t=1}^{40}\in\mathbb R^{40\times3}
 \]
 
 加噪并去噪，主要存在三个问题：
@@ -39,30 +39,24 @@
 
 ---
 
-## 2. 时间定义：先修正“6 帧、2 Hz、5 s”的冲突
+## 2. 时间定义：5 帧 1 Hz keyframe 与 40 点 LiDAR 轨迹
 
-nuScenes 相机原始采样频率约为 12 Hz，标注 keyframe 为 2 Hz。以下三者不能同时成立：
-
-- 6 个视觉帧；
-- 2 Hz；
-- 覆盖从当前到未来 5 s。
-
-本项目确认采用方案 A，并将时间戳全部配置化：
+视觉与动作使用独立时间轴，并将所有时间设置配置化：
 
 | 方案 | 视觉时间戳（含当前帧） | 帧数 | 覆盖范围 | 用途 |
 |---|---:|---:|---:|---|
-| A，已确认 | `[0, 1, 2, 3, 4, 5] s` | 6 | 5 s | 首轮正式配置 |
-| B | `[0, 0.5, ..., 5.0] s` | 11 | 5 s | 严格使用 2 Hz keyframes |
-| C | `[0, 1/12, ..., 5.0] s` | 61 | 5 s | 仅作为高成本上界，不用于首轮实验 |
+| A，当前默认 | `[0, 1, 2, 3, 4] s` | 5 | 4 s | 官方 CAM_FRONT keyframe |
+| B | `[0, 0.5, ..., 4.0] s` | 9 | 4 s | 使用全部 2 Hz keyframe |
+| C | `[0, 1/12, ..., 4.0] s` | 49 | 4 s | 12 Hz 相机流高成本上界 |
 
 默认动作定义为：
 
 ```text
 anchor time:       t0
-teacher images:    t0 + [0, 1, 2, 3, 4, 5] s
-future trajectory: t0 + [1/12, 2/12, ..., 60/12] s
-trajectory shape:  [60, 3], 不包含 t0
-anchor stride:     0.5 s（2 Hz），可配置
+teacher images:    t0 + [0, 1, 2, 3, 4] s，官方 CAM_FRONT keyframe
+window trajectory: t0 + [0.1, 0.2, ..., 4.0] s，LiDAR keyframe+sweeps
+trajectory shape:  [40, 3]，不包含 t0
+anchor stride:     默认每个官方 keyframe，可配置
 ```
 
 视觉未来帧只在 tokenizer 的 teacher/posterior 训练中使用。action expert 训练和部署时只接收当前及历史观测，不能接触未来图像。
@@ -77,7 +71,7 @@ anchor stride:     0.5 s（2 Hz），可配置
 flowchart TD
     V["当前与未来前视图"] --> PE["冻结 PE-Spatial"]
     PE --> EV["视觉转移编码器 q_vis"]
-    A["GT 轨迹 60×3"] --> EA["轨迹编码器 E_traj"]
+    A["GT 轨迹 40×3"] --> EA["轨迹编码器 E_traj"]
     EV --> ZV["视觉 action tokens z_vis"]
     EA --> ZA["轨迹 action tokens z_traj"]
     ZV <-->|"对齐损失"| ZA
@@ -94,12 +88,12 @@ flowchart TD
     N["latent noise"] --> EXP
     EXP --> ZH["预测 action tokens"]
     ZH --> DEC["冻结 Tokenizer Decoder"]
-    DEC --> TRAJ["未来 5 s 轨迹"]
+    DEC --> TRAJ["未来 4 s 轨迹"]
 ```
 
 这里的 decoder 是一个独立 action codec：推理时只读取 action expert 预测的 latent，不读取 PE context。当前/历史 condition tokens 只进入 action expert，用于预测 latent。
 
-Stage II 的所有基线必须使用完全相同的 condition encoder、训练数据、优化步数和推理采样预算，只更换 action 表征，才能回答“视觉 action latent 是否优于 `[60,3]` 点空间”这一核心问题。
+Stage II 的所有基线必须使用完全相同的 condition encoder、训练数据、优化步数和推理采样预算，只更换 action 表征，才能回答“视觉 action latent 是否优于 `[40,3]` 点空间”这一核心问题。
 
 ---
 
@@ -136,20 +130,23 @@ class FrameRecord:
     camera_intrinsic: FloatTensor  # [3, 3]
 ```
 
-如果当前 pkl 没有 `scene_token`、12 Hz ego pose 或相机时间戳，则从 nuScenes devkit 的 `sample_data -> ego_pose` 链补齐，并生成新的只读 manifest；不覆盖原始 pkl。
+scene 由官方 `sample.json` 补齐。LiDAR 轨迹始终从官方
+`sample_data -> ego_pose` 链读取，同时解析 `calibrated_sensor` 中的 LiDAR→ego 外参；不使用
+12 Hz pkl 的插值 ego pose，也不覆盖原始 pkl。
 
 ## 4.2 样本窗口构造
 
 每个 anchor 只在满足以下条件时成为有效样本：
 
-1. 当前帧、全部 teacher 图像及 60 个轨迹时刻属于同一 scene；
-2. 未来覆盖不少于 5 s；
+1. 当前帧、全部 teacher 图像及 40 个轨迹时刻属于同一 scene；
+2. 未来覆盖不少于 4 s；
 3. 每个图像实际时间与目标时间的误差低于 `max_image_time_error_ms`；
 4. ego pose 可用且旋转四元数合法；
 5. 文件路径存在，图像可解码；
 6. 不跨越异常的大时间间隔。
 
-索引时使用时间戳二分查找而不是假设列表严格为 12 Hz。输出每个 split 的：
+索引时使用时间戳二分查找，不假设相机或 LiDAR 严格等间隔。默认直接选择最近的 LiDAR
+实测 pose；只有 `trajectory_sampling: interpolate` 时才使用 SE(3) 插值。输出每个 split 的：
 
 - 有效/无效窗口数量；
 - 无效原因统计；
@@ -179,16 +176,16 @@ class FrameRecord:
 数据预处理同时计算：
 
 ```text
-position     [60, 2]
-yaw          [60, 1]
-speed        [60, 1]
-acceleration [60, 1]
-yaw_rate     [60, 1]
-jerk         [60, 1]
-curvature    [60, 1]  # 低速区域带 mask
+position     [40, 2]
+yaw          [40, 1]
+speed        [40, 1]
+acceleration [40, 1]
+yaw_rate     [40, 1]
+jerk         [40, 1]
+curvature    [40, 1]  # 低速区域带 mask
 ```
 
-所有导数使用真实时间戳差分，不在数据层偷假设严格 `dt=1/12`。
+所有导数使用实际匹配到的 sweep 时间戳差分，不在数据层偷假设严格 `dt=0.1`。
 
 ## 4.4 图像预处理
 
@@ -202,7 +199,7 @@ curvature    [60, 1]  # 低速区域带 mask
 ## 4.5 切分与泄漏防护
 
 - 严格沿用 nuScenes 官方 scene-level train/val 划分；
-- 相邻 12 Hz 窗口高度重复，默认 anchor stride 为 0.5 s，不把 12 Hz 的每一帧都作为 anchor；
+- anchor 只取官方 keyframe，`anchor_stride_s` 可进一步降低相邻窗口重叠；
 - train/val manifest 中 scene token 不得相交，启动训练前强制断言；
 - latent normalizer 只用 train split 统计；
 - 所有消融实验共享同一份版本化 manifest。
@@ -232,7 +229,7 @@ curvature    [60, 1]  # 低速区域带 mask
 
 ## 5.2 Token 压缩
 
-512/16 会产生约 `32×32=1024` 个 patch tokens。6 帧直接进入时序 Transformer 成本过高，因此分两级压缩：
+512/16 会产生约 `32×32=1024` 个 patch tokens。5 帧直接进入时序 Transformer 成本仍高，因此分两级压缩：
 
 1. 固定的二维 adaptive pooling：`32×32 -> 8×8`，得到每帧 64 tokens；
 2. 可学习 `SpatialResampler`：64 tokens -> 16 或 32 tokens/帧，再投影到 `model_dim=512`。
@@ -282,7 +279,7 @@ PE 默认冻结，因此支持 `cache_pe_features.py`：
 
 ```text
 K = 10 action tokens
-每个 token 对应 0.5 s 宏时间段
+每个 token 对应约 0.4 s 宏时间段
 latent shape = [K, D_z]，默认 [10, 256]
 ```
 
@@ -319,17 +316,18 @@ Decoder 接口：
 ```python
 trajectory = decoder(
     action_tokens=z,           # [B, K, Dz]
-    query_times=t_future,      # [B, 60]
+    query_times=t_future,      # [B, 40]
 )
 ```
 
-`query_times` 只是固定/可配置的时间网格，不携带场景或未来观测信息。默认 5 s、12 Hz 时，它固定为 `[1/12, ..., 60/12]`。
+`query_times` 只携带实际 LiDAR sweep 相对时间，不包含场景或未来观测信息。默认目标是
+4 s、10 Hz，但允许数毫秒的传感器采样抖动。
 
 实现两种 head：
 
 ### Head A：Direct trajectory baseline
 
-直接输出 60 个局部坐标轨迹点，用于验证训练管线和作为强基线。
+直接输出 40 个局部坐标轨迹点，用于验证训练管线和作为强基线。
 
 ### Head B：Kinematic head（推荐默认）
 
@@ -440,7 +438,7 @@ L(v,\hat v)+L(a,\hat a)+L(\omega,\hat\omega)+L(j,\hat j).
 1. 同一样本 token-wise cosine / Smooth-L1；
 2. batch 内 InfoNCE，负样本来自其他轨迹窗口；
 3. VICReg 风格 variance/covariance regularization，防止所有 latent 聚为一点；
-4. 时间局部对齐：第 `k` 个 action token 主要对齐对应 0.5 s 轨迹段。
+4. 时间局部对齐：第 `k` 个 action token 主要对齐对应约 0.4 s 轨迹段。
 
 必须对负样本做邻近时间过滤：同一 scene、相邻时刻的轨迹可能几乎相同，不能一律当强负样本。
 
@@ -465,7 +463,7 @@ L(v,\hat v)+L(a,\hat a)+L(\omega,\hat\omega)+L(j,\hat j).
 1. 检查 pkl schema；
 2. 生成统一 manifest；
 3. 验证 scene 边界、时间戳和 SE(2) 轨迹；
-4. 可视化 100 个随机样本：6 帧图像 + 局部轨迹 + 速度/加速度；
+4. 可视化 100 个随机样本：5 帧图像 + 局部轨迹 + 速度/加速度；
 5. 在继续训练前人工抽查 20 个样本。
 
 ### Phase 1：最小可行 tokenizer
@@ -502,7 +500,7 @@ tokenizer_checkpoint_hash
 ### Phase 4：训练 latent action expert
 
 - action expert 输入保持现有 condition tokens；
-- 输出 shape 从 `[60,3]` 替换为 `[10,256]`；
+- 输出 shape 从 `[40,3]` 替换为 `[10,256]`；
 - 支持 diffusion `epsilon/v-prediction` 与 flow matching，由配置选择；
 - tokenizer decoder 默认冻结；
 - 第二阶段可用小学习率联合微调 decoder，但必须保留冻结版对照；
@@ -520,7 +518,7 @@ tokenizer_checkpoint_hash
 
 | ID | action 表征 | 视觉未来监督 | 对齐损失 | 目的 |
 |---|---|---:|---:|---|
-| B0 | 原始 `[60,3]` diffusion/flow | 否 | 否 | 当前方法基线 |
+| B0 | 原始 `[40,3]` diffusion/flow | 否 | 否 | 当前方法基线 |
 | B1 | trajectory AE latent | 否 | 否 | 判断收益是否仅来自压缩 |
 | B2 | trajectory VAE latent | 否 | 否 | 判断收益是否仅来自分布正则 |
 | B3 | visual AE latent | 是 | 否 | 检验视觉转移编码本身 |
@@ -530,7 +528,7 @@ tokenizer_checkpoint_hash
 
 ## 9.2 关键消融
 
-- 视觉帧：单终点帧 / 6 帧 1 Hz / 11 帧 2 Hz；
+- 视觉帧：单终点帧 / 5 帧 1 Hz / 9 帧 2 Hz；
 - backbone：PE-Core / PE-Spatial；
 - PE layer：中间层 / 最后层 / 多层融合；
 - latent token 数：1 / 5 / 10 / 20；
@@ -574,7 +572,7 @@ tokenizer_checkpoint_hash
 - visual/traj latent 的 CKA、cosine、MMD；
 - 同轨迹不同外观的一致性；
 - 同场景不同动作的可分性；
-- token 时间定位：遮蔽第 k 个 token 对对应 0.5 s 轨迹段的影响；
+- token 时间定位：遮蔽第 k 个 token 对对应约 0.4 s 轨迹段的影响；
 - latent 插值轨迹是否连续、无突变。
 
 行为标签优先由 GT 轨迹规则自动生成，规则和阈值版本化；不得用 val 指标反复调标签阈值。
@@ -834,7 +832,7 @@ checkpoint 必须保存：
 
 每个实验自动生成：
 
-- 当前/未来 6 帧；
+- 当前/未来 5 帧；
 - GT、visual-latent reconstruction、traj-latent reconstruction；
 - 速度/加速度/yaw-rate/jerk 曲线；
 - latent token 相似度矩阵；
@@ -849,7 +847,7 @@ checkpoint 必须保存：
 
 - 完成 pkl schema 报告、窗口统计和随机样本可视化；
 - 冻结时间定义、坐标系和数据 adapter；
-- 验收：人工确认轨迹朝向、帧顺序和 5 s horizon。
+- 验收：人工确认轨迹朝向、帧顺序和 4 s horizon。
 
 ### M1：基础工程与 deterministic AE（2–3 天）
 
@@ -889,7 +887,7 @@ checkpoint 必须保存：
 | PE 空间不适合驾驶运动 | 视觉辅助 loss 不降、下游无收益 | 中间层/多层融合；比较 PE-Core/Spatial；后续轻量微调 |
 | 前视图不足 | 转弯/并线动作歧义高 | 第二阶段扩展前左/前右或六视图；接口已预留 view 维 |
 | 过度平滑 | ADE 尚可但急刹/急转响应迟缓 | 动力学量拟合 GT，而非只惩罚导数；按行为子集评估 |
-| 12 Hz 插值 pose 不准 | 导数噪声、jerk 异常 | 时间戳审计、平滑仅用于派生监督、原始 pose 保留 |
+| 12 Hz 插值 pose 不准 | 导数噪声、jerk 异常 | 改用官方 LiDAR keyframe+sweep ego pose，默认最近邻不插值 |
 | 缓存过大/过期 | I/O 成瓶颈或配置错配 | 固定 pooling、分 shard、hash 校验、可选在线模式 |
 | “闭环”结论被高估 | replay 好但偏离后无真实图像 | 明确 L0/L1/L2 等级，最终结论只对应实际验证层级 |
 
@@ -897,8 +895,10 @@ checkpoint 必须保存：
 
 ## 17. 已确认的 5 项设计决定
 
-1. **视觉帧时间**：使用 6 帧 `[0,1,2,3,4,5] s` 表征完整 5 s 状态转移。它们从 12 Hz 相机流按目标时间戳选择，不再称为“2 Hz 的 6 个 keyframes”。
-2. **动作定义**：action 是 anchor ego frame 下未来 60 个 `[x,y,yaw]` 轨迹点，不是 steering/throttle/brake。
+1. **视觉帧时间**：使用 5 张官方 CAM_FRONT keyframe，目标时间为 `[0,1,2,3,4] s`，实际时间戳及容差写入 manifest/config。
+2. **动作定义**：action 是 4 s 输入视觉窗口 `(t0,t0+4s]` 内的 40 个 LiDAR pose
+   `[x,y,yaw]`，不是 steering/throttle/brake。`t0` 在 anchor ego frame 中恒为零，因此
+   不重复保存；保留 `t0+4s` 以对齐最后一张视觉帧。
 3. **PE 默认型号**：首轮使用 `PE-Spatial-B16-512`，核心假设成立后再扩展 L/G。
 4. **decoder 接口**：主方法采用 `Decoder(Z) -> trajectory`，不读取当前 PE context。当前/未来 PE 只用于训练视觉 action latent；action expert 推理时用其原有 condition tokens 预测 `Z`，再由独立 decoder 还原轨迹。context-conditioned decoder 仅保留为消融。
 5. **闭环等级**：nuScenes 首版实现 L0 replay 与 L1 kinematic rollout；真正视觉闭环 L2 后续接 CARLA 或现有 world model。

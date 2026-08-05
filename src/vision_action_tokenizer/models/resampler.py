@@ -17,7 +17,9 @@ class SpatialResampler(nn.Module):
         self, input_dim: int, model_dim: int, num_queries: int, num_heads: int, dropout: float
     ) -> None:
         super().__init__()
-        self.input_projection = nn.Sequential(nn.LayerNorm(input_dim), nn.Linear(input_dim, model_dim))
+        self.input_projection = nn.Sequential(
+            nn.LayerNorm(input_dim), nn.Linear(input_dim, model_dim)
+        )
         self.queries = nn.Parameter(torch.randn(num_queries, model_dim) * 0.02)
         self.attention = nn.MultiheadAttention(
             model_dim, num_heads, dropout=dropout, batch_first=True
@@ -32,4 +34,3 @@ class SpatialResampler(nn.Module):
         queries = self.queries.unsqueeze(0).expand(batch * frames, -1, -1)
         output, _ = self.attention(queries, memory, memory, need_weights=False)
         return self.output_norm(output).reshape(batch, frames, output.shape[1], output.shape[2])
-

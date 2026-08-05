@@ -54,4 +54,3 @@ def reduce_metrics(metrics: dict[str, Tensor], world_size: int) -> dict[str, Ten
 def cleanup_distributed() -> None:
     if dist.is_initialized():
         dist.destroy_process_group()
-

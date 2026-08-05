@@ -18,7 +18,9 @@ from vision_action_tokenizer.closed_loop import (
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--scenario", required=True, type=Path, help="NPZ with timestamps and ego_states")
+    parser.add_argument(
+        "--scenario", required=True, type=Path, help="NPZ with timestamps and ego_states"
+    )
     parser.add_argument("--plans", required=True, type=Path, help="NPY [replans,T,3]")
     parser.add_argument("--level", choices=("l0", "l1"), default="l1")
     parser.add_argument("--execute-points", type=int, default=6)
@@ -42,4 +44,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

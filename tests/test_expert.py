@@ -23,4 +23,3 @@ def test_latent_diffusion_train_and_sample() -> None:
     sample = diffusion.sample(condition, (2, 8), sampling_steps=4)
     assert torch.isfinite(loss)
     assert sample.shape == latent.shape
-

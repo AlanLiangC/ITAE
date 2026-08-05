@@ -113,9 +113,9 @@ def alignment_loss(visual: Tensor, trajectory: Tensor, temperature: float) -> Te
     # VICReg-style variance floor prevents both branches from satisfying cosine loss
     # by mapping every driving behavior to the same action token.
     variance = functional.relu(1.0 - visual.flatten(0, 1).std(dim=0, unbiased=False)).mean()
-    variance = variance + functional.relu(
-        1.0 - trajectory.flatten(0, 1).std(dim=0, unbiased=False)
-    ).mean()
+    variance = (
+        variance + functional.relu(1.0 - trajectory.flatten(0, 1).std(dim=0, unbiased=False)).mean()
+    )
     return cosine + contrastive + 0.1 * variance
 
 
@@ -135,7 +135,9 @@ class TokenizerLoss(nn.Module):
         global_step: int = 0,
     ) -> tuple[Tensor, dict[str, Tensor]]:
         rec_vis = reconstruction_loss(output.reconstruction_vis, target_trajectory, trajectory_mask)
-        rec_traj = reconstruction_loss(output.reconstruction_traj, target_trajectory, trajectory_mask)
+        rec_traj = reconstruction_loss(
+            output.reconstruction_traj, target_trajectory, trajectory_mask
+        )
         reconstruction = rec_vis + rec_traj
         dynamics = dynamics_loss(
             output.reconstruction_vis, target_trajectory, future_times, trajectory_mask
@@ -144,18 +146,19 @@ class TokenizerLoss(nn.Module):
         )
         physical = physical_loss(
             output.reconstruction_vis, future_times, trajectory_mask, self.config
-        ) + physical_loss(
-            output.reconstruction_traj, future_times, trajectory_mask, self.config
-        )
+        ) + physical_loss(output.reconstruction_traj, future_times, trajectory_mask, self.config)
         kl = kl_loss(output.mean_vis, output.logvar_vis, self.config.kl_free_bits)
         alignment = alignment_loss(
             output.mean_vis, output.latent_traj, self.config.info_nce_temperature
         )
-        visual_transition = 1.0 - functional.cosine_similarity(
-            output.predicted_transition,
-            output.target_transition,
-            dim=-1,
-        ).mean()
+        visual_transition = (
+            1.0
+            - functional.cosine_similarity(
+                output.predicted_transition,
+                output.target_transition,
+                dim=-1,
+            ).mean()
+        )
         kl_scale = min(1.0, global_step / max(self.config.kl_warmup_steps, 1))
         total = (
             self.config.reconstruction_weight * reconstruction
@@ -179,4 +182,3 @@ class TokenizerLoss(nn.Module):
             "posterior/std": torch.exp(0.5 * output.logvar_vis).mean().detach(),
         }
         return total, terms
-

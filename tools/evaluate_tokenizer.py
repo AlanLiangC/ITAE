@@ -34,15 +34,20 @@ def main() -> None:
         int(config["data"]["image_size"]),
         load_images=args.feature_cache is None,
     )
-    dataset = base if args.feature_cache is None else CachedPEFeatureDataset(
-        base,
-        args.feature_cache,
-        manifest_path=args.manifest,
-        expected_metadata={
-            "model_name": config["pe"]["model_name"],
-            "layer_idx": config["pe"].get("layer_idx"),
-            "pool_size": config["pe"]["pool_size"],
-        },
+    dataset = (
+        base
+        if args.feature_cache is None
+        else CachedPEFeatureDataset(
+            base,
+            args.feature_cache,
+            manifest_path=args.manifest,
+            expected_metadata={
+                "model_name": config["pe"]["model_name"],
+                "checkpoint_path": config["pe"].get("checkpoint_path"),
+                "layer_idx": config["pe"].get("layer_idx"),
+                "pool_size": config["pe"]["pool_size"],
+            },
+        )
     )
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
     tokenizer = build_tokenizer(config).to(device).eval()
@@ -52,14 +57,19 @@ def main() -> None:
     if args.feature_cache is None:
         pe = config["pe"]
         extractor = PEFeatureExtractor(
-            pe["model_name"], pe.get("layer_idx"), int(pe["pool_size"]), freeze=True
+            model_name=pe["model_name"],
+            checkpoint_path=pe.get("checkpoint_path"),
+            layer_idx=pe.get("layer_idx"),
+            pool_size=int(pe["pool_size"]),
+            forward_batch_size=pe.get("forward_batch_size"),
+            freeze=True,
         ).to(device)
     totals: dict[str, float] = defaultdict(float)
     batches = 0
     with torch.inference_mode():
         for batch in loader:
             features = (
-                batch["visual_features"].to(device)
+                batch["visual_features"].to(device).float()
                 if extractor is None
                 else extractor(batch["images"].to(device))
             )
@@ -90,4 +100,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

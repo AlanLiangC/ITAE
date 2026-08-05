@@ -36,7 +36,9 @@ class TrajectoryDecoder(nn.Module):
         self.max_speed_mps = max_speed_mps
         self.max_accel_mps2 = max_accel_mps2
         self.max_yaw_rate_rps = max_yaw_rate_rps
-        self.memory_projection = nn.Sequential(nn.LayerNorm(latent_dim), nn.Linear(latent_dim, model_dim))
+        self.memory_projection = nn.Sequential(
+            nn.LayerNorm(latent_dim), nn.Linear(latent_dim, model_dim)
+        )
         self.time_projection = MLP(model_dim, model_dim, model_dim)
         layer = nn.TransformerDecoderLayer(
             d_model=model_dim,
@@ -107,4 +109,3 @@ def integrate_unicycle(
         speed = next_speed
         states.append(torch.stack([x, y, yaw], dim=-1))
     return torch.stack(states, dim=1)
-
