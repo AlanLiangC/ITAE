@@ -17,7 +17,7 @@ from vision_action_tokenizer.data.dataset import CachedPEFeatureDataset, NuScene
 from vision_action_tokenizer.metrics import trajectory_metrics
 from vision_action_tokenizer.models.factory import build_tokenizer, tokenizer_state_from_checkpoint
 from vision_action_tokenizer.models.pe import PEFeatureExtractor
-from vision_action_tokenizer.visualization import render_bev_trajectory_comparison
+from vision_action_tokenizer.visualization import render_evaluation_diagnostic
 
 
 def main() -> None:
@@ -33,10 +33,24 @@ def main() -> None:
     args = parser.parse_args()
     config = load_config(args.config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tensorboard_config = config.get("tensorboard", {})
+    visualize_items = (
+        int(tensorboard_config.get("evaluation_visualization_items", 0))
+        if args.visualize_items is None
+        else args.visualize_items
+    )
+    if visualize_items < 0:
+        raise ValueError("--visualize-items must be non-negative")
+    include_input_images = bool(
+        tensorboard_config.get("evaluation_visualization_include_images", True)
+    )
     base = NuScenesWindowDataset(
         args.manifest,
         int(config["data"]["image_size"]),
-        load_images=args.feature_cache is None,
+        load_images=(
+            args.feature_cache is None
+            or (include_input_images and visualize_items > 0)
+        ),
     )
     dataset = (
         base
@@ -57,14 +71,6 @@ def main() -> None:
     tokenizer = build_tokenizer(config).to(device).eval()
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     tokenizer.load_state_dict(tokenizer_state_from_checkpoint(checkpoint), strict=True)
-    tensorboard_config = config.get("tensorboard", {})
-    visualize_items = (
-        int(tensorboard_config.get("evaluation_visualization_items", 0))
-        if args.visualize_items is None
-        else args.visualize_items
-    )
-    if visualize_items < 0:
-        raise ValueError("--visualize-items must be non-negative")
     writer = None
     if bool(tensorboard_config.get("enabled", False)) or args.tensorboard_dir is not None:
         tensorboard_dir = args.tensorboard_dir or args.output.parent / "tensorboard_eval"
@@ -126,16 +132,23 @@ def main() -> None:
                         scene_token = str(scene_tokens[item_index])
                         if distinct_scenes and scene_token in visualized_scenes:
                             continue
-                        image = render_bev_trajectory_comparison(
+                        camera_images = (
+                            batch.get("images", [None] * trajectory.shape[0])[item_index]
+                            if include_input_images
+                            else None
+                        )
+                        image = render_evaluation_diagnostic(
                             trajectory[item_index],
                             output.reconstruction_vis[item_index],
                             output.reconstruction_traj[item_index],
                             times[item_index],
+                            camera_images=camera_images,
+                            frame_times=batch["frame_times"][item_index],
                             sample_token=str(sample_tokens[item_index]),
                             mask=mask[item_index],
                         )
                         writer.add_image(
-                            f"evaluation/bev/item_{visualization_count:03d}",
+                            f"evaluation/diagnostic_2x2/item_{visualization_count:03d}",
                             image,
                             tensorboard_step,
                         )

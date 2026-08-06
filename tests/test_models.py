@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as functional
 from torch import nn
 
-from vision_action_tokenizer.losses import LossConfig, TokenizerLoss
+from vision_action_tokenizer.losses import LossConfig, TokenizerLoss, alignment_loss
 from vision_action_tokenizer.models.decoder import TrajectoryDecoder
 from vision_action_tokenizer.models.pe import PEFeatureExtractor
+from vision_action_tokenizer.models.resampler import SpatialResampler
 from vision_action_tokenizer.models.tokenizer import VisionActionTokenizer
 
 
@@ -38,6 +40,23 @@ def test_context_free_decoders() -> None:
         assert torch.isfinite(trajectory).all()
 
 
+def test_grid_resampler_keeps_patch_order() -> None:
+    resampler = SpatialResampler(4, 4, 4, 1, 0, mode="grid")
+    resampler.input_projection = nn.Identity()
+    resampler.output_norm = nn.Identity()
+    nn.init.zeros_(resampler.spatial_embedding)
+    features = torch.arange(16, dtype=torch.float32).reshape(1, 1, 4, 4)
+    assert torch.equal(resampler(features), features)
+
+
+def test_alignment_uses_stop_gradient_trajectory_teacher() -> None:
+    visual = torch.randn(3, 2, 4, requires_grad=True)
+    trajectory = torch.randn(3, 2, 4, requires_grad=True)
+    alignment_loss(visual, trajectory, temperature=0.1).backward()
+    assert visual.grad is not None
+    assert trajectory.grad is None
+
+
 def test_full_tokenizer_loss_backward() -> None:
     tokenizer = VisionActionTokenizer(
         pe_feature_dim=16,
@@ -57,10 +76,14 @@ def test_full_tokenizer_loss_backward() -> None:
     future_times = torch.arange(1, 13).float().unsqueeze(0).repeat(3, 1) / 12
     mask = torch.ones(3, 12, dtype=torch.bool)
     output = tokenizer(visual, trajectory, frame_times, future_times, mask)
+    expected_transition = visual.mean(dim=2)[:, 1:] - visual.mean(dim=2)[:, :1]
+    expected_transition = functional.layer_norm(expected_transition, (visual.shape[-1],))
+    assert torch.allclose(output.target_transition, expected_transition)
     loss, terms = TokenizerLoss(LossConfig(kl_warmup_steps=1))(
         output, trajectory, future_times, mask, global_step=1
     )
     loss.backward()
     assert torch.isfinite(loss)
     assert "loss/alignment" in terms
+    assert "loss/visual_scale" in terms
     assert tokenizer.visual_encoder.to_mean.weight.grad is not None

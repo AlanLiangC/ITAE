@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as functional
 from torch import Tensor, nn
 
 from .common import MLP, make_transformer_encoder, sinusoidal_time_embedding
@@ -12,8 +13,9 @@ class VisualTransitionEncoder(nn.Module):
     """Infer Gaussian action tokens from current-to-future visual transitions.
 
     Current PE tokens are used only here. They never enter the trajectory decoder.
-    Future tokens query the current tokens to estimate a matched baseline; the
-    residual becomes transition memory, reducing static appearance leakage.
+    The default path differences matching spatial grid cells and preserves that
+    ordered residual through fixed pooling. Legacy content matching remains an
+    explicit ablation mode.
     """
 
     def __init__(
@@ -24,22 +26,43 @@ class VisualTransitionEncoder(nn.Module):
         num_heads: int,
         num_layers: int,
         dropout: float,
+        transition_mode: str = "spatial_difference",
     ) -> None:
         super().__init__()
+        if transition_mode not in {"spatial_difference", "content_match"}:
+            raise ValueError(
+                "VisualTransitionEncoder transition_mode must be "
+                "`spatial_difference` or `content_match`"
+            )
         self.model_dim = model_dim
         self.num_action_tokens = num_action_tokens
+        self.transition_mode = transition_mode
         self.time_projection = MLP(model_dim, model_dim, model_dim)
-        self.current_match = nn.MultiheadAttention(
-            model_dim, num_heads, dropout=dropout, batch_first=True
+        self.current_match = (
+            nn.MultiheadAttention(
+                model_dim, num_heads, dropout=dropout, batch_first=True
+            )
+            if transition_mode == "content_match"
+            else None
         )
         self.transition_norm = nn.LayerNorm(model_dim)
         self.transition_encoder = make_transformer_encoder(
             model_dim, num_heads, num_layers, dropout
         )
-        self.action_queries = nn.Parameter(torch.randn(num_action_tokens, model_dim) * 0.02)
-        self.action_attention = nn.MultiheadAttention(
-            model_dim, num_heads, dropout=dropout, batch_first=True
-        )
+        if transition_mode == "content_match":
+            self.action_queries = nn.Parameter(
+                torch.randn(num_action_tokens, model_dim) * 0.02
+            )
+            self.action_attention = nn.MultiheadAttention(
+                model_dim, num_heads, dropout=dropout, batch_first=True
+            )
+            self.pooled_action_projection = None
+        else:
+            self.register_parameter("action_queries", None)
+            self.action_attention = None
+            self.pooled_action_projection = MLP(
+                model_dim, model_dim * 2, model_dim, dropout
+            )
         self.posterior_norm = nn.LayerNorm(model_dim)
         self.to_mean = nn.Linear(model_dim, latent_dim)
         self.to_logvar = nn.Linear(model_dim, latent_dim)
@@ -54,23 +77,53 @@ class VisualTransitionEncoder(nn.Module):
         time_embedding = self.time_projection(
             sinusoidal_time_embedding(frame_times, self.model_dim)
         ).unsqueeze(2)
-        tokens = frame_tokens + time_embedding
-        current = tokens[:, 0]
-        future = tokens[:, 1:].reshape(batch, (frames - 1) * tokens_per_frame, dim)
-
-        # PE patch indices do not track the same world point after ego motion. Cross-attention
-        # estimates a content-matched current baseline before forming the visual residual.
-        matched_current, _ = self.current_match(future, current, current, need_weights=False)
-        transition = self.transition_norm(future - matched_current)
-        transition = self.transition_encoder(transition)
+        if self.transition_mode == "content_match":
+            tokens = frame_tokens + time_embedding
+            current = tokens[:, 0]
+            future = tokens[:, 1:].reshape(batch, (frames - 1) * tokens_per_frame, dim)
+            assert self.current_match is not None
+            matched_current, _ = self.current_match(
+                future, current, current, need_weights=False
+            )
+            transition = future - matched_current
+            transition = self.transition_encoder(self.transition_norm(transition))
+        else:
+            # Grid token r has stable image coordinates across frames. Retaining current,
+            # future and their signed difference avoids the content-query collapse observed
+            # when every query converges to the same globally averaged scene descriptor.
+            current = frame_tokens[:, :1].expand(-1, frames - 1, -1, -1)
+            future = frame_tokens[:, 1:]
+            delta = functional.layer_norm(future - current, (dim,))
+            transition = delta + 0.1 * current + time_embedding[:, 1:]
+            transition = transition.reshape(batch, (frames - 1) * tokens_per_frame, dim)
+            # An explicit residual around the temporal encoder prevents it from erasing
+            # the frozen PE motion delta during optimization.
+            transition = transition + self.transition_encoder(
+                self.transition_norm(transition)
+            )
 
         horizon = frame_times[:, -1:].clamp_min(1e-3)
         fractions = torch.arange(self.num_action_tokens, device=frame_times.device) + 0.5
         fractions = fractions.to(frame_times.dtype) / self.num_action_tokens
         centers = horizon * fractions.unsqueeze(0)
-        queries = self.action_queries.unsqueeze(0).expand(batch, -1, -1)
-        queries = queries + self.time_projection(sinusoidal_time_embedding(centers, self.model_dim))
-        posterior, _ = self.action_attention(queries, transition, transition, need_weights=False)
+        action_time = self.time_projection(
+            sinusoidal_time_embedding(centers, self.model_dim)
+        )
+        if self.transition_mode == "content_match":
+            assert self.action_queries is not None and self.action_attention is not None
+            queries = self.action_queries.unsqueeze(0).expand(batch, -1, -1)
+            queries = queries + action_time
+            posterior, _ = self.action_attention(
+                queries, transition, transition, need_weights=False
+            )
+        else:
+            # Preserve the ordered transition sequence all the way into action tokens.
+            # Learned content queries previously converged to identical global averages.
+            pooled = functional.adaptive_avg_pool1d(
+                transition.transpose(1, 2), self.num_action_tokens
+            ).transpose(1, 2)
+            assert self.pooled_action_projection is not None
+            posterior = pooled + self.pooled_action_projection(pooled) + action_time
         posterior = self.posterior_norm(posterior)
         mean = self.to_mean(posterior)
         logvar = self.to_logvar(posterior).clamp(-10.0, 6.0)

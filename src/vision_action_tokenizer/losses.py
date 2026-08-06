@@ -27,6 +27,8 @@ class LossConfig:
     max_decel_mps2: float = 8.0
     max_jerk_mps3: float = 10.0
     max_yaw_rate_rps: float = 1.2
+    trajectory_pretrain_steps: int = 0
+    visual_ramp_steps: int = 0
 
 
 def _masked_mean(values: Tensor, mask: Tensor | None) -> Tensor:
@@ -100,7 +102,14 @@ def kl_loss(mean: Tensor, logvar: Tensor, free_bits: float) -> Tensor:
 
 
 def alignment_loss(visual: Tensor, trajectory: Tensor, temperature: float) -> Tensor:
-    """Align modalities without allowing a constant collapsed representation."""
+    """Regress visual actions onto a stop-gradient trajectory teacher.
+
+    The previous symmetric cosine objective let the easy trajectory branch move
+    toward an already collapsed visual branch. Here trajectory features are a
+    per-sample teacher: only the visual encoder receives alignment gradients.
+    """
+    trajectory = trajectory.detach()
+    regression = functional.smooth_l1_loss(visual, trajectory)
     visual_flat = functional.normalize(visual.flatten(1), dim=-1)
     trajectory_flat = functional.normalize(trajectory.flatten(1), dim=-1)
     cosine = 1.0 - (visual_flat * trajectory_flat).sum(dim=-1).mean()
@@ -110,13 +119,26 @@ def alignment_loss(visual: Tensor, trajectory: Tensor, temperature: float) -> Te
         functional.cross_entropy(logits, labels)
         + functional.cross_entropy(logits.transpose(0, 1), labels)
     )
-    # VICReg-style variance floor prevents both branches from satisfying cosine loss
-    # by mapping every driving behavior to the same action token.
-    variance = functional.relu(1.0 - visual.flatten(0, 1).std(dim=0, unbiased=False)).mean()
-    variance = (
-        variance + functional.relu(1.0 - trajectory.flatten(0, 1).std(dim=0, unbiased=False)).mean()
+    # Measure variance across samples, not across action-token positions. The latter
+    # can be large even when every sample has exactly the same representation.
+    if visual.shape[0] > 1:
+        variance = functional.relu(
+            1.0 - visual.flatten(1).std(dim=0, unbiased=False)
+        ).mean()
+    else:
+        variance = visual.new_zeros(())
+    return regression + cosine + 0.1 * contrastive + 0.1 * variance
+
+
+def _off_diagonal_cosine(latent: Tensor) -> Tensor:
+    if latent.shape[0] < 2:
+        return latent.new_zeros(())
+    normalized = functional.normalize(latent.flatten(1), dim=-1)
+    similarities = normalized @ normalized.transpose(0, 1)
+    diagonal = torch.eye(
+        latent.shape[0], dtype=torch.bool, device=latent.device
     )
-    return cosine + contrastive + 0.1 * variance
+    return similarities.masked_select(~diagonal).mean()
 
 
 class TokenizerLoss(nn.Module):
@@ -139,19 +161,25 @@ class TokenizerLoss(nn.Module):
             output.reconstruction_traj, target_trajectory, trajectory_mask
         )
         reconstruction = rec_vis + rec_traj
-        dynamics = dynamics_loss(
+        dynamics_vis = dynamics_loss(
             output.reconstruction_vis, target_trajectory, future_times, trajectory_mask
-        ) + dynamics_loss(
+        )
+        dynamics_traj = dynamics_loss(
             output.reconstruction_traj, target_trajectory, future_times, trajectory_mask
         )
-        physical = physical_loss(
+        dynamics = dynamics_vis + dynamics_traj
+        physical_vis = physical_loss(
             output.reconstruction_vis, future_times, trajectory_mask, self.config
-        ) + physical_loss(output.reconstruction_traj, future_times, trajectory_mask, self.config)
+        )
+        physical_traj = physical_loss(
+            output.reconstruction_traj, future_times, trajectory_mask, self.config
+        )
+        physical = physical_vis + physical_traj
         kl = kl_loss(output.mean_vis, output.logvar_vis, self.config.kl_free_bits)
         alignment = alignment_loss(
             output.mean_vis, output.latent_traj, self.config.info_nce_temperature
         )
-        visual_transition = (
+        visual_transition_cosine = (
             1.0
             - functional.cosine_similarity(
                 output.predicted_transition,
@@ -159,14 +187,30 @@ class TokenizerLoss(nn.Module):
                 dim=-1,
             ).mean()
         )
+        visual_transition_regression = functional.smooth_l1_loss(
+            output.predicted_transition, output.target_transition
+        )
+        visual_transition = visual_transition_cosine + 0.1 * visual_transition_regression
         kl_scale = min(1.0, global_step / max(self.config.kl_warmup_steps, 1))
+        if global_step < self.config.trajectory_pretrain_steps:
+            visual_scale = 0.0
+        elif self.config.visual_ramp_steps <= 0:
+            visual_scale = 1.0
+        else:
+            visual_scale = min(
+                1.0,
+                (global_step - self.config.trajectory_pretrain_steps)
+                / self.config.visual_ramp_steps,
+            )
         total = (
-            self.config.reconstruction_weight * reconstruction
-            + self.config.dynamics_weight * dynamics
-            + self.config.physical_weight * physical
-            + self.config.kl_weight * kl_scale * kl
-            + self.config.alignment_weight * alignment
-            + self.config.visual_transition_weight * visual_transition
+            self.config.reconstruction_weight * (rec_traj + visual_scale * rec_vis)
+            + self.config.dynamics_weight
+            * (dynamics_traj + visual_scale * dynamics_vis)
+            + self.config.physical_weight
+            * (physical_traj + visual_scale * physical_vis)
+            + self.config.kl_weight * kl_scale * visual_scale * kl
+            + self.config.alignment_weight * visual_scale * alignment
+            + self.config.visual_transition_weight * visual_scale * visual_transition
         )
         terms = {
             "loss/total": total.detach(),
@@ -177,8 +221,19 @@ class TokenizerLoss(nn.Module):
             "loss/physical": physical.detach(),
             "loss/kl": kl.detach(),
             "loss/kl_scale": total.new_tensor(kl_scale),
+            "loss/visual_scale": total.new_tensor(visual_scale),
             "loss/alignment": alignment.detach(),
             "loss/visual_transition": visual_transition.detach(),
+            "loss/visual_transition_cosine": visual_transition_cosine.detach(),
+            "loss/visual_transition_regression": visual_transition_regression.detach(),
             "posterior/std": torch.exp(0.5 * output.logvar_vis).mean().detach(),
+            "posterior/visual_batch_std": output.mean_vis.flatten(1)
+            .std(dim=0, unbiased=False)
+            .mean()
+            .detach(),
+            "posterior/visual_offdiag_cosine": _off_diagonal_cosine(output.mean_vis).detach(),
+            "posterior/trajectory_offdiag_cosine": _off_diagonal_cosine(
+                output.latent_traj
+            ).detach(),
         }
         return total, terms

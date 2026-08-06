@@ -13,3 +13,4 @@ data/action_latents/
 *.pth
 *.safetensors
 data/nuscenes
+output

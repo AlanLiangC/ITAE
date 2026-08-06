@@ -27,6 +27,10 @@ def build_tokenizer(config: dict[str, Any]) -> VisionActionTokenizer:
         num_visual_frames=len(config["data"]["frame_offsets_s"]),
         max_speed_mps=float(model["max_speed_mps"]),
         trajectory_position_scale_m=float(model.get("trajectory_position_scale_m", 50.0)),
+        resampler_type=str(model.get("resampler_type", "grid")),
+        visual_transition_mode=str(
+            model.get("visual_transition_mode", "spatial_difference")
+        ),
     )
 
 

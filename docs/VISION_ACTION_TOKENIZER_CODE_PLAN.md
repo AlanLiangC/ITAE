@@ -232,7 +232,9 @@ curvature    [40, 1]  # 低速区域带 mask
 512/16 会产生约 `32×32=1024` 个 patch tokens。5 帧直接进入时序 Transformer 成本仍高，因此分两级压缩：
 
 1. 固定的二维 adaptive pooling：`32×32 -> 8×8`，得到每帧 64 tokens；
-2. 可学习 `SpatialResampler`：64 tokens -> 16 或 32 tokens/帧，再投影到 `model_dim=512`。
+2. 保序 `SpatialResampler`：用二维 adaptive pooling 将 64 tokens 压到 16 或 32
+   tokens/帧，再投影到 `model_dim`。默认不用 learned content queries，避免所有 query
+   收敛到同一全局均值；旧 query 模式仅保留为消融项。
 
 不允许一开始就只保留单个 CLS/global token，否则会直接损失本项目要验证的视觉空间语义。
 
@@ -275,12 +277,14 @@ PE 默认冻结，因此支持 `cache_pe_features.py`：
 - frame-type embedding（current/future）；
 - 可选相机 embedding，为多视角扩展预留。
 
-采用带时间锚点的 latent queries 从未来 PE tokens 中 cross-attend：
+当前 V2 对相同二维网格位置计算 `LayerNorm(PE_t - PE_0)`，并在时序 Transformer 外保留
+显式 residual；随后按固定时空顺序池化成带时间锚点的 action tokens。这样视觉运动差异
+不会被内容查询提前平均掉。旧版 cross-attention 作为可配置消融保留：
 
 ```text
 K = 10 action tokens
 每个 token 对应约 0.4 s 宏时间段
-latent shape = [K, D_z]，默认 [10, 256]
+latent shape = [K, D_z]，当前默认 [10, 64]
 ```
 
 编码器输出对角高斯后验：

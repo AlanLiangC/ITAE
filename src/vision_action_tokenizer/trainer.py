@@ -17,7 +17,7 @@ from torch.utils.tensorboard import SummaryWriter
 from .distributed import DistributedContext, reduce_metrics
 from .losses import TokenizerLoss
 from .metrics import trajectory_metrics
-from .visualization import render_bev_trajectory_comparison
+from .visualization import render_evaluation_diagnostic
 
 
 def _to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
@@ -68,6 +68,9 @@ class TokenizerTrainer:
         self.precision = precision
         self.grad_clip_norm = grad_clip_norm
         self.config = config or {}
+        self.sample_posterior = bool(
+            self.config.get("train", {}).get("sample_posterior", True)
+        )
         self.global_step = 0
         self.best_ade = math.inf
         self.scaler = torch.cuda.amp.GradScaler(
@@ -79,6 +82,12 @@ class TokenizerTrainer:
         )
         self.eval_visualization_every = int(
             tensorboard_config.get("evaluation_visualization_every_epochs", 1)
+        )
+        self.eval_visualization_include_images = bool(
+            tensorboard_config.get("evaluation_visualization_include_images", True)
+        )
+        self.eval_visualization_distinct_scenes = bool(
+            tensorboard_config.get("evaluation_visualization_distinct_scenes", True)
         )
         if self.eval_visualization_items < 0:
             raise ValueError("tensorboard.evaluation_visualization_items must be non-negative")
@@ -153,7 +162,7 @@ class TokenizerTrainer:
                     "frame_times": batch["frame_times"],
                     "future_times": batch["future_times"],
                     "trajectory_mask": batch["trajectory_mask"],
-                    "sample_posterior": True,
+                    "sample_posterior": self.sample_posterior,
                 }
                 feature_key = "visual_features" if "visual_features" in batch else "images"
                 model_inputs[feature_key] = batch[feature_key]
@@ -197,6 +206,7 @@ class TokenizerTrainer:
         totals: dict[str, Tensor] = {}
         batches = 0
         visualization_count = 0
+        visualized_scenes: set[str] = set()
         render_visualizations = (
             self.writer is not None
             and self.eval_visualization_items > 0
@@ -233,23 +243,38 @@ class TokenizerTrainer:
             if render_visualizations and visualization_count < self.eval_visualization_items:
                 batch_size = batch["trajectory"].shape[0]
                 sample_tokens = batch.get("sample_token", [""] * batch_size)
+                scene_tokens = batch.get("scene_token", [""] * batch_size)
                 for item_index in range(batch_size):
                     if visualization_count >= self.eval_visualization_items:
                         break
-                    image = render_bev_trajectory_comparison(
+                    scene_token = str(scene_tokens[item_index])
+                    if (
+                        self.eval_visualization_distinct_scenes
+                        and scene_token in visualized_scenes
+                    ):
+                        continue
+                    camera_images = (
+                        batch.get("images", [None] * batch_size)[item_index]
+                        if self.eval_visualization_include_images
+                        else None
+                    )
+                    image = render_evaluation_diagnostic(
                         batch["trajectory"][item_index],
                         output.reconstruction_vis[item_index],
                         output.reconstruction_traj[item_index],
                         batch["future_times"][item_index],
+                        camera_images=camera_images,
+                        frame_times=batch["frame_times"][item_index],
                         sample_token=str(sample_tokens[item_index]),
                         mask=batch["trajectory_mask"][item_index],
                     )
                     assert self.writer is not None
                     self.writer.add_image(
-                        f"evaluation/bev/item_{visualization_count:03d}",
+                        f"evaluation/diagnostic_2x2/item_{visualization_count:03d}",
                         image,
                         self.global_step,
                     )
+                    visualized_scenes.add(scene_token)
                     visualization_count += 1
             for key, value in terms.items():
                 totals[key] = totals.get(key, torch.zeros_like(value)) + value

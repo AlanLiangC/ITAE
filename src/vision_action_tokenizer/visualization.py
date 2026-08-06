@@ -6,7 +6,7 @@ from collections.abc import Sequence
 
 import numpy as np
 import torch
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 from torch import Tensor
 
 
@@ -175,6 +175,239 @@ def render_bev_trajectory_comparison(
         draw.text(
             (left + 14 * scale, panel_bottom - 17 * scale),
             f"FDE={endpoint_error:.2f}m" if panel_index else "time: green -> yellow -> red",
+            fill=(205, 210, 220),
+            font=small_font,
+        )
+
+    canvas = canvas.resize((width, height), Image.Resampling.LANCZOS)
+    array = np.asarray(canvas, dtype=np.float32) / 255.0
+    return torch.from_numpy(array).permute(2, 0, 1).contiguous()
+
+
+def _camera_frame_to_image(frame: Tensor | np.ndarray) -> Image.Image:
+    array = _to_numpy(frame)
+    if array.ndim != 3:
+        raise ValueError(f"Expected camera frame [3,H,W] or [H,W,3], got {array.shape}")
+    if array.shape[0] in {1, 3, 4}:
+        array = np.moveaxis(array, 0, -1)
+    if array.shape[-1] != 3:
+        raise ValueError(f"Expected an RGB camera frame, got {array.shape}")
+    # LetterboxNormalize maps RGB from [0,1] to [-1,1]. Also accept already
+    # display-ready tensors so the renderer remains useful outside this dataset.
+    if float(array.min()) < -0.01:
+        array = array * 0.5 + 0.5
+    array = np.clip(array, 0.0, 1.0)
+    return Image.fromarray(np.round(array * 255).astype(np.uint8), mode="RGB")
+
+
+def render_evaluation_diagnostic(
+    target: Tensor | np.ndarray,
+    reconstruction_vis: Tensor | np.ndarray,
+    reconstruction_traj: Tensor | np.ndarray,
+    future_times: Tensor | np.ndarray,
+    camera_images: Tensor | np.ndarray | None,
+    frame_times: Tensor | np.ndarray | None,
+    sample_token: str = "",
+    mask: Tensor | np.ndarray | None = None,
+    width: int = 1200,
+    height: int = 900,
+) -> Tensor:
+    """Render a TensorBoard-ready 2x2 camera/trajectory diagnostic page.
+
+    The top-left panel contains every CAM_FRONT input frame. The remaining panels
+    show GT, visual-latent reconstruction and trajectory-latent reconstruction in
+    BEV with shared metric bounds.
+    """
+    trajectories = [
+        _to_numpy(target),
+        _to_numpy(reconstruction_vis),
+        _to_numpy(reconstruction_traj),
+    ]
+    times = _to_numpy(future_times).reshape(-1)
+    if any(trajectory.ndim != 2 or trajectory.shape[1] < 2 for trajectory in trajectories):
+        raise ValueError("Expected each trajectory to have shape [T,3] or [T,>=2]")
+    if any(len(trajectory) != len(times) for trajectory in trajectories):
+        raise ValueError("Trajectories and future_times must have the same length")
+    if mask is not None:
+        valid = _to_numpy(mask).astype(bool).reshape(-1)
+        if len(valid) != len(times):
+            raise ValueError("mask and future_times must have the same length")
+        trajectories = [trajectory[valid] for trajectory in trajectories]
+        times = times[valid]
+    if len(times) == 0:
+        raise ValueError("Cannot render an empty trajectory")
+
+    frames = None if camera_images is None else _to_numpy(camera_images)
+    frame_time_values = None if frame_times is None else _to_numpy(frame_times).reshape(-1)
+    if frames is not None:
+        if frames.ndim != 4:
+            raise ValueError(f"Expected camera_images [F,3,H,W], got {frames.shape}")
+        if frame_time_values is not None and len(frame_time_values) != len(frames):
+            raise ValueError("camera_images and frame_times must have the same frame count")
+
+    all_xy = np.concatenate([trajectory[:, :2] for trajectory in trajectories], axis=0)
+    all_xy = np.vstack([all_xy, np.zeros((1, 2), dtype=np.float32)])
+    x_min, y_min = np.min(all_xy, axis=0)
+    x_max, y_max = np.max(all_xy, axis=0)
+    x_span = max(float(x_max - x_min), 10.0)
+    y_span = max(float(y_max - y_min), 10.0)
+    x_center = 0.5 * float(x_min + x_max)
+    y_center = 0.5 * float(y_min + y_max)
+    x_min, x_max = x_center - 0.6 * x_span, x_center + 0.6 * x_span
+    y_min, y_max = y_center - 0.6 * y_span, y_center + 0.6 * y_span
+
+    scale = 2
+    canvas = Image.new("RGB", (width * scale, height * scale), (15, 18, 24))
+    draw = ImageDraw.Draw(canvas)
+    try:
+        header_font = ImageFont.truetype("DejaVuSans.ttf", 15 * scale)
+        title_font = ImageFont.truetype("DejaVuSans.ttf", 13 * scale)
+        small_font = ImageFont.truetype("DejaVuSans.ttf", 10 * scale)
+    except OSError:
+        header_font = ImageFont.load_default(size=15 * scale)
+        title_font = ImageFont.load_default(size=13 * scale)
+        small_font = ImageFont.load_default(size=10 * scale)
+
+    outer = 18 * scale
+    gap = 14 * scale
+    header_h = 52 * scale
+    panel_w = (width * scale - 2 * outer - gap) / 2
+    panel_h = (height * scale - header_h - outer - gap) / 2
+    panel_positions = (
+        (outer, header_h),
+        (outer + panel_w + gap, header_h),
+        (outer, header_h + panel_h + gap),
+        (outer + panel_w + gap, header_h + panel_h + gap),
+    )
+    draw.text(
+        (outer, 12 * scale),
+        (
+            "Evaluation diagnostic | CAM_FRONT + shared-scale BEV | "
+            f"trajectory={times[0]:.2f}..{times[-1]:.2f}s | sample=...{sample_token[-12:]}"
+        ),
+        fill=(235, 238, 245),
+        font=header_font,
+    )
+
+    def panel_box(position: tuple[float, float], title: str) -> tuple[float, float, float, float]:
+        left, top = position
+        right, bottom = left + panel_w, top + panel_h
+        draw.rounded_rectangle(
+            (left, top, right, bottom),
+            radius=12 * scale,
+            fill=(27, 32, 42),
+            outline=(67, 76, 92),
+            width=2,
+        )
+        draw.text(
+            (left + 14 * scale, top + 8 * scale),
+            title,
+            fill=(235, 238, 245),
+            font=title_font,
+        )
+        return left, top, right, bottom
+
+    camera_left, camera_top, camera_right, camera_bottom = panel_box(
+        panel_positions[0], "CAM_FRONT input window"
+    )
+    if frames is None:
+        draw.text(
+            (camera_left + 18 * scale, camera_top + 52 * scale),
+            "Input images unavailable (enable evaluation_visualization_include_images).",
+            fill=(190, 196, 208),
+            font=small_font,
+        )
+    else:
+        columns = 3
+        rows = 2
+        inner_gap = 8 * scale
+        content_left = camera_left + 12 * scale
+        content_top = camera_top + 38 * scale
+        content_width = camera_right - camera_left - 24 * scale
+        content_height = camera_bottom - content_top - 10 * scale
+        cell_width = (content_width - (columns - 1) * inner_gap) / columns
+        cell_height = (content_height - (rows - 1) * inner_gap) / rows
+        for frame_index, frame in enumerate(frames[: columns * rows]):
+            row, column = divmod(frame_index, columns)
+            cell_left = content_left + column * (cell_width + inner_gap)
+            cell_top = content_top + row * (cell_height + inner_gap)
+            label_height = 17 * scale
+            thumbnail = ImageOps.contain(
+                _camera_frame_to_image(frame),
+                (max(1, round(cell_width)), max(1, round(cell_height - label_height))),
+                Image.Resampling.LANCZOS,
+            )
+            paste_x = round(cell_left + (cell_width - thumbnail.width) / 2)
+            paste_y = round(cell_top + label_height)
+            canvas.paste(thumbnail, (paste_x, paste_y))
+            relative_time = (
+                float(frame_time_values[frame_index])
+                if frame_time_values is not None
+                else float(frame_index)
+            )
+            draw.text(
+                (cell_left + 2 * scale, cell_top),
+                f"frame {frame_index} | t={relative_time:.2f}s",
+                fill=(205, 210, 220),
+                font=small_font,
+            )
+
+    panel_titles = (
+        "GT trajectory",
+        "Visual-latent reconstruction",
+        "Trajectory-latent reconstruction",
+    )
+    endpoints = [trajectory[-1, :2] for trajectory in trajectories]
+    ade_errors = [
+        float(np.linalg.norm(trajectory[:, :2] - trajectories[0][:, :2], axis=-1).mean())
+        for trajectory in trajectories
+    ]
+    for trajectory_index, (position, title) in enumerate(
+        zip(panel_positions[1:], panel_titles)
+    ):
+        left, top, right, bottom = panel_box(position, title)
+        plot_left = left + 26 * scale
+        plot_right = right - 20 * scale
+        plot_top = top + 38 * scale
+        plot_bottom = bottom - 25 * scale
+
+        def project(
+            xy: np.ndarray,
+            left_bound: float = plot_left,
+            right_bound: float = plot_right,
+            top_bound: float = plot_top,
+            bottom_bound: float = plot_bottom,
+        ) -> list[tuple[float, float]]:
+            u = left_bound + (y_max - xy[:, 1]) / (y_max - y_min) * (
+                right_bound - left_bound
+            )
+            v = top_bound + (x_max - xy[:, 0]) / (x_max - x_min) * (
+                bottom_bound - top_bound
+            )
+            return list(zip(u.astype(float), v.astype(float)))
+
+        origin = project(np.zeros((1, 2), dtype=np.float32))[0]
+        draw.line((plot_left, origin[1], plot_right, origin[1]), fill=(65, 72, 84), width=2)
+        draw.line((origin[0], plot_top, origin[0], plot_bottom), fill=(65, 72, 84), width=2)
+        draw.text((origin[0] + 4 * scale, plot_top), "x+", fill=(135, 143, 158), font=small_font)
+        draw.text((plot_left, origin[1] - 15 * scale), "y+", fill=(135, 143, 158), font=small_font)
+        target_points = [origin, *project(trajectories[0][:, :2])]
+        if trajectory_index:
+            _draw_dashed_path(draw, target_points, fill=(170, 175, 185))
+        prediction_points = [origin, *project(trajectories[trajectory_index][:, :2])]
+        _draw_time_colored_path(draw, prediction_points)
+        endpoint_error = float(np.linalg.norm(endpoints[trajectory_index] - endpoints[0]))
+        footer = (
+            "time: green -> yellow -> red"
+            if trajectory_index == 0
+            else (
+                f"ADE={ade_errors[trajectory_index]:.2f}m | "
+                f"FDE={endpoint_error:.2f}m | dashed=GT"
+            )
+        )
+        draw.text(
+            (left + 14 * scale, bottom - 19 * scale),
+            footer,
             fill=(205, 210, 220),
             font=small_font,
         )

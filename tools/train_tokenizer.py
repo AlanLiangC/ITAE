@@ -49,10 +49,13 @@ def cache_for_split(config: dict, split: str):
 
 def make_dataset(manifest: Path, config: dict, split: str, overfit_samples: int | None = None):
     cache = cache_for_split(config, split)
+    include_eval_images = bool(
+        config.get("tensorboard", {}).get("evaluation_visualization_include_images", True)
+    )
     base = NuScenesWindowDataset(
         manifest,
         image_size=int(config["data"]["image_size"]),
-        load_images=cache is None,
+        load_images=cache is None or (split == "val" and include_eval_images),
     )
     dataset = (
         base

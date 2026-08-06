@@ -41,7 +41,7 @@
                 "--val-manifest",
                 "${workspaceFolder}/data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl",
                 "--output",
-                "./output/itae_debug_tokenizer"
+                "./output/itae_v2_tokenizer"
             ],
             "env": {
                 "PYTHONUNBUFFERED": "1",

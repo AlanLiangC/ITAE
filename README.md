@@ -1,7 +1,7 @@
 # Vision-Aligned Action Tokenizer
 
 面向端到端自动驾驶 action expert 的视觉对齐连续动作 tokenizer。默认配置把 4 s 输入
-视觉窗口内 `(t0, t0+4s]` 的 `[40, 3] = [x, y, yaw]` 自车轨迹编码为 `[10, 256]`
+视觉窗口内 `(t0, t0+4s]` 的 `[40, 3] = [x, y, yaw]` 自车轨迹编码为 `[10, 64]`
 action tokens，并让 latent 同时满足：
 
 - 可从当前到未来的 PE-Spatial 视觉状态转移中提取；
@@ -15,7 +15,7 @@ action tokens，并让 latent 同时满足：
 - 5 帧官方 CAM_FRONT keyframe `[0, 1, 2, 3, 4] s` 视觉窗口；
 - 官方 `LIDAR_TOP sample_data -> ego_pose` 构建的 40 点、10 Hz 实测轨迹；
 - `PE-Spatial-B16-512` patch-token 提取与离线缓存；
-- 视觉转移 CVAE、轨迹编码器、共享无上下文 decoder；
+- 保留二维网格顺序的视觉转移编码器、轨迹编码器、共享无上下文 decoder；
 - direct 和可微 unicycle 两种 trajectory head；
 - 重建、动力学、物理、KL、跨模态对齐、视觉转移损失；
 - latent diffusion action expert；
@@ -27,10 +27,10 @@ action tokens，并让 latent 同时满足：
 Tokenizer 训练：
 
 ```text
-5 images -> frozen PE -> visual transition encoder -> z_vis --+
+5 images -> frozen PE -> same-grid temporal delta -> z_vis ---+
                                                               +-> shared Decoder(z) -> trajectory
 GT trajectory -----------> trajectory encoder -> z_traj -----+
-                                      z_vis <-> z_traj alignment
+                              z_vis -> stop-grad(z_traj) alignment
 ```
 
 Action expert 推理：
@@ -164,11 +164,12 @@ LiDAR pose 最近邻距离、可见投影点数量以及 local/global 两条解�
 默认配置位于 `configs/nuscenes_lidar10hz_front_4s.yaml`。最小训练命令：
 
 ```bash
-torchrun --standalone --nproc_per_node=1 tools/train_tokenizer.py \
+/home/alan/miniconda3/envs/openmmlab/bin/torchrun \
+  --standalone --nproc_per_node=1 tools/train_tokenizer.py \
   --config configs/nuscenes_lidar10hz_front_4s.yaml \
-  --train-manifest data/manifests/train.jsonl \
-  --val-manifest data/manifests/val.jsonl \
-  --output outputs/tokenizer
+  --train-manifest data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
+  --val-manifest data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl \
+  --output output/itae_v2_tokenizer
 ```
 
 多卡时修改 `--nproc_per_node`。训练脚本支持 DDP、BF16/FP16、断点恢复、梯度裁剪和
@@ -176,7 +177,7 @@ torchrun --standalone --nproc_per_node=1 tools/train_tokenizer.py \
 BEV 轨迹重建对比写入 `<output>/tensorboard`：
 
 ```bash
-tensorboard --logdir outputs/tokenizer_lidar10hz_4s/tensorboard --port 6006
+tensorboard --logdir output/itae_v2_tokenizer/tensorboard --port 6006
 ```
 
 默认 `train.resume: auto`：启动时扫描 `--output` 目录下的 `*.pt`，按修改时间自动恢复
@@ -194,10 +195,17 @@ train:
 命令行 `--resume /path/to/checkpoint.pt` 的优先级最高；临时强制从头训练可加
 `--no-resume`。若自动扫描的 output 目录为空，会打印提示并正常从 epoch 0 开始。
 
-验证可视化数量和频率由配置控制。每个 item 包含 GT、visual-latent reconstruction 和
-trajectory-latent reconstruction 三个共享尺度的 BEV 面板；绿→黄→红表示窗口内时间由近
-到远，重建面板中的灰色虚线是 GT。默认从不同 scene 各取一个固定 item，避免连续窗口
-重复，并确保不同 epoch 可在同一 TensorBoard image tag 下比较：
+当前 V2 的维度、resampler、visual transition 和 decoder 都与早期
+`output/itae_debug_tokenizer` 权重不兼容。首次训练必须使用新的 output（如上面的
+`output/itae_v2_tokenizer`）；之后同一目录会继续自动恢复。V2 默认先训练 500 step 的轨迹
+codec，再用 1000 step 渐进打开视觉重建/对齐；训练时可在 TensorBoard 的
+`train/loss/visual_scale` 确认阶段是否符合预期。
+
+验证可视化数量和频率由配置控制。每个 item 是一个 2×2 诊断页：左上显示 5 帧
+CAM_FRONT 输入，其余三个面板分别是 GT、visual-latent reconstruction 和
+trajectory-latent reconstruction 的共享尺度 BEV；绿→黄→红表示窗口内时间由近到远，
+重建面板中的灰色虚线是 GT。默认从不同 scene 各取一个固定 item，避免连续窗口重复，并
+确保不同 epoch 可在同一 TensorBoard image tag 下比较：
 
 ```yaml
 tensorboard:
@@ -206,15 +214,21 @@ tensorboard:
   flush_secs: 30
   evaluation_visualization_items: 8
   evaluation_visualization_every_epochs: 1
+  evaluation_visualization_include_images: true
   evaluation_visualization_distinct_scenes: true
 ```
+
+即使训练使用离线 PE feature cache，验证集也会在需要可视化的 item 上读取原始主视图；若
+希望完全跳过图像 I/O，可将 `evaluation_visualization_include_images: false`。
+图像写入 TensorBoard 的 `evaluation/diagnostic_2x2/item_*`，同一个 tag 在不同 epoch
+保持不变，便于拖动 step 对照输入场景和重建轨迹的变化。
 
 建议按以下顺序验证：
 
 1. `--overfit-samples 64`，确认数据、坐标和 decoder 能过拟合；
-2. 将 `loss.kl_weight=0` 做 deterministic warm-up；
-3. 开启 KL annealing、轨迹—视觉对齐和 PE transition loss；
-4. 比较 direct 与 kinematic decoder。
+2. 保持 `sample_posterior: false`、`kl_weight: 0`，先验证 deterministic codec；
+3. 观察 `train/posterior/visual_offdiag_cosine`，不能长期接近 1；
+4. 基线稳定后再单独消融 KL 或 kinematic decoder，不要直接恢复 V1 checkpoint。
 
 独立评估命令：
 
