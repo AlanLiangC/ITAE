@@ -1,159 +1,131 @@
-"""Complete vision-aligned continuous action tokenizer."""
+"""VGGT-Omega geometry-to-action tokenizer."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as functional
 from torch import Tensor, nn
 
-from .decoder import TrajectoryDecoder
-from .encoders import TrajectoryEncoder, VisualTransitionEncoder
-from .resampler import SpatialResampler
+from .common import sinusoidal_time_embedding
+from .decoder import SE2IncrementDecoder
 
 
 @dataclass
 class TokenizerOutput:
-    """Outputs required by reconstruction, alignment, KL and visual losses."""
+    """Single-path visual action encoding and context-free reconstruction."""
 
-    mean_vis: Tensor
-    logvar_vis: Tensor
-    latent_vis: Tensor
-    latent_traj: Tensor
-    reconstruction_vis: Tensor
-    reconstruction_traj: Tensor
-    predicted_transition: Tensor
-    target_transition: Tensor
+    action_tokens: Tensor
+    reconstruction: Tensor
+    predicted_increments: Tensor
 
 
-class FutureTransitionPredictor(nn.Module):
-    """Predict pooled future PE changes from action tokens as an auxiliary target."""
+class IntervalActionEncoder(nn.Module):
+    """Turn five CameraHead frame representations into four motion intervals."""
 
     def __init__(
         self,
-        latent_dim: int,
-        model_dim: int,
-        output_dim: int,
-        num_future_frames: int,
-        num_heads: int,
+        input_dim: int = 2048,
+        frame_geometry_dim: int = 256,
+        action_dim: int = 128,
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
-        self.num_future_frames = num_future_frames
-        self.latent_projection = nn.Linear(latent_dim, model_dim)
-        self.frame_queries = nn.Parameter(torch.randn(num_future_frames, model_dim) * 0.02)
-        self.attention = nn.MultiheadAttention(model_dim, num_heads, batch_first=True)
-        self.output = nn.Sequential(nn.LayerNorm(model_dim), nn.Linear(model_dim, output_dim))
-
-    def forward(self, latent: Tensor) -> Tensor:
-        memory = self.latent_projection(latent)
-        queries = self.frame_queries.unsqueeze(0).expand(latent.shape[0], -1, -1)
-        prediction, _ = self.attention(queries, memory, memory, need_weights=False)
-        return self.output(prediction)
-
-
-class VisionActionTokenizer(nn.Module):
-    """Learn a visual action posterior aligned with a trajectory action encoder."""
-
-    def __init__(
-        self,
-        pe_feature_dim: int = 768,
-        model_dim: int = 512,
-        latent_dim: int = 256,
-        num_action_tokens: int = 10,
-        resampled_tokens_per_frame: int = 32,
-        num_heads: int = 8,
-        encoder_layers: int = 4,
-        decoder_layers: int = 4,
-        dropout: float = 0.1,
-        decoder_type: str = "kinematic",
-        num_visual_frames: int = 6,
-        max_speed_mps: float = 35.0,
-        trajectory_position_scale_m: float = 50.0,
-        resampler_type: str = "grid",
-        visual_transition_mode: str = "spatial_difference",
-    ) -> None:
-        super().__init__()
-        self.resampler = SpatialResampler(
-            pe_feature_dim,
-            model_dim,
-            resampled_tokens_per_frame,
-            num_heads,
-            dropout,
-            mode=resampler_type,
+        self.frame_geometry_dim = frame_geometry_dim
+        self.frame_projection = nn.Sequential(
+            nn.LayerNorm(input_dim * 2),
+            nn.Linear(input_dim * 2, frame_geometry_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(frame_geometry_dim, frame_geometry_dim),
+            nn.LayerNorm(frame_geometry_dim),
         )
-        self.visual_encoder = VisualTransitionEncoder(
-            model_dim,
-            latent_dim,
-            num_action_tokens,
-            num_heads,
-            encoder_layers,
-            dropout,
-            transition_mode=visual_transition_mode,
-        )
-        self.trajectory_encoder = TrajectoryEncoder(
-            model_dim,
-            latent_dim,
-            num_action_tokens,
-            num_heads,
-            encoder_layers,
-            dropout,
-            trajectory_position_scale_m,
-        )
-        self.decoder = TrajectoryDecoder(
-            latent_dim,
-            model_dim,
-            num_heads,
-            decoder_layers,
-            dropout,
-            decoder_type,
-            max_speed_mps=max_speed_mps,
-        )
-        self.transition_predictor = FutureTransitionPredictor(
-            latent_dim, model_dim, pe_feature_dim, num_visual_frames - 1, num_heads
+        interval_input_dim = frame_geometry_dim * 4
+        self.interval_projection = nn.Sequential(
+            nn.LayerNorm(interval_input_dim),
+            nn.Linear(interval_input_dim, frame_geometry_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(frame_geometry_dim, action_dim),
+            nn.LayerNorm(action_dim),
         )
 
     def forward(
         self,
-        visual_features: Tensor,
-        trajectory: Tensor,
+        camera_hidden: Tensor,
+        register_hidden_mean: Tensor,
+        frame_times: Tensor,
+    ) -> Tensor:
+        if camera_hidden.shape != register_hidden_mean.shape or camera_hidden.ndim != 3:
+            raise ValueError(
+                "camera_hidden and register_hidden_mean must share shape [B,F,C]"
+            )
+        if frame_times.shape != camera_hidden.shape[:2]:
+            raise ValueError("frame_times must align with CameraHead features [B,F]")
+        if camera_hidden.shape[1] < 2:
+            raise ValueError("At least two frames are required to form an action interval")
+        delta_t = torch.diff(frame_times, dim=1)
+        if torch.any(delta_t <= 0):
+            raise ValueError("frame_times must be strictly increasing")
+
+        geometry = self.frame_projection(
+            torch.cat([camera_hidden.float(), register_hidden_mean.float()], dim=-1)
+        )
+        time = sinusoidal_time_embedding(delta_t, self.frame_geometry_dim)
+        left, right = geometry[:, :-1], geometry[:, 1:]
+        interval = torch.cat([left, right, right - left, time], dim=-1)
+        return self.interval_projection(interval)
+
+
+class VisionActionTokenizer(nn.Module):
+    """Encode VGGT CameraHead hidden tokens and decode a 10 Hz local trajectory."""
+
+    def __init__(
+        self,
+        vggt_feature_dim: int = 2048,
+        frame_geometry_dim: int = 256,
+        action_token_dim: int = 128,
+        num_action_tokens: int = 4,
+        steps_per_token: int = 10,
+        decoder_hidden_dim: int = 256,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.num_action_tokens = num_action_tokens
+        self.steps_per_token = steps_per_token
+        self.encoder = IntervalActionEncoder(
+            input_dim=vggt_feature_dim,
+            frame_geometry_dim=frame_geometry_dim,
+            action_dim=action_token_dim,
+            dropout=dropout,
+        )
+        self.decoder = SE2IncrementDecoder(
+            action_dim=action_token_dim,
+            hidden_dim=decoder_hidden_dim,
+            steps_per_token=steps_per_token,
+            dropout=dropout,
+        )
+
+    def forward(
+        self,
+        camera_hidden: Tensor,
+        register_hidden_mean: Tensor,
         frame_times: Tensor,
         future_times: Tensor,
-        trajectory_mask: Tensor | None = None,
-        sample_posterior: bool = True,
     ) -> TokenizerOutput:
-        frame_tokens = self.resampler(visual_features)
-        mean_vis, logvar_vis, _ = self.visual_encoder(frame_tokens, frame_times)
-        if sample_posterior:
-            latent_vis = mean_vis + torch.exp(0.5 * logvar_vis) * torch.randn_like(mean_vis)
-        else:
-            latent_vis = mean_vis
-        latent_traj = self.trajectory_encoder(trajectory, future_times, trajectory_mask)
-
-        # Both paths share the same context-free decoder. This prevents current PE
-        # features from becoming an inference-time shortcut around the action latent.
-        reconstruction_vis = self.decoder(latent_vis, future_times)
-        reconstruction_traj = self.decoder(latent_traj, future_times)
-        predicted_transition = self.transition_predictor(latent_vis)
-        # Use the frozen PE output for the auxiliary target. A target made from the
-        # trainable resampler can move with the predictor and admit the trivial solution
-        # where all frames and samples collapse to one vector.
-        raw_global = visual_features.mean(dim=2)
-        target_transition = raw_global[:, 1:] - raw_global[:, :1]
-        target_transition = functional.layer_norm(
-            target_transition, (target_transition.shape[-1],)
-        )
+        if camera_hidden.shape[1] - 1 != self.num_action_tokens:
+            raise ValueError(
+                f"Expected {self.num_action_tokens + 1} frames, got {camera_hidden.shape[1]}"
+            )
+        action_tokens = self.encoder(camera_hidden, register_hidden_mean, frame_times)
+        reconstruction, increments = self.decoder(action_tokens, future_times)
         return TokenizerOutput(
-            mean_vis=mean_vis,
-            logvar_vis=logvar_vis,
-            latent_vis=latent_vis,
-            latent_traj=latent_traj,
-            reconstruction_vis=reconstruction_vis,
-            reconstruction_traj=reconstruction_traj,
-            predicted_transition=predicted_transition,
-            target_transition=target_transition.detach(),
+            action_tokens=action_tokens,
+            reconstruction=reconstruction,
+            predicted_increments=increments,
         )
 
     def decode(self, action_tokens: Tensor, future_times: Tensor) -> Tensor:
-        """Decode `[B,K,Dz]` action tokens without any visual context."""
-        return self.decoder(action_tokens, future_times)
+        """Decode `[B,4,D]` action tokens without any visual context."""
+        reconstruction, _ = self.decoder(action_tokens, future_times)
+        return reconstruction

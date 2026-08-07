@@ -21,7 +21,10 @@ class TemporalIndex(Generic[T]):
     def __init__(self, timestamps_us: list[int], values: list[T]) -> None:
         if len(timestamps_us) != len(values) or not timestamps_us:
             raise ValueError("timestamps and values must have the same non-zero length")
-        if any(right <= left for left, right in zip(timestamps_us, timestamps_us[1:])):
+        if any(
+            right <= left
+            for left, right in zip(timestamps_us, timestamps_us[1:], strict=False)
+        ):
             raise ValueError("timestamps must be strictly increasing within a scene")
         self.timestamps_us = timestamps_us
         self.values = values

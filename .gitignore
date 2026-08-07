@@ -8,9 +8,10 @@ dist/
 outputs/
 data/manifests/
 data/pe_cache/
+data/vggt_omega_cache/
 data/action_latents/
 *.pt
 *.pth
 *.safetensors
 data/nuscenes
-output
+output/

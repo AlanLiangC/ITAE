@@ -136,7 +136,10 @@ def _future_poses(
         raise RuntimeError(f"Incomplete future trajectory at {anchor_timestamp_us}")
     valid_matches = [match for match in matches if match is not None]
     timestamps_us = [match.value.timestamp_us for match in valid_matches]
-    if any(right <= left for left, right in zip(timestamps_us, timestamps_us[1:])):
+    if any(
+        right <= left
+        for left, right in zip(timestamps_us, timestamps_us[1:], strict=False)
+    ):
         raise RuntimeError(
             f"Repeated or out-of-order LiDAR trajectory pose at {anchor_timestamp_us}"
         )

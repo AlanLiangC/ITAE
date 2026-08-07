@@ -10,14 +10,16 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from PIL import Image
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.tensorboard import SummaryWriter
 
+from .data.dataset import VGGTOmegaResize
 from .distributed import DistributedContext, reduce_metrics
 from .losses import TokenizerLoss
 from .metrics import trajectory_metrics
-from .visualization import render_evaluation_diagnostic
+from .visualization import render_vggt_evaluation_diagnostic
 
 
 def _to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
@@ -32,18 +34,35 @@ def _unwrap(model: nn.Module) -> nn.Module:
 
 
 def _checkpoint_model_state(model: nn.Module) -> dict[str, Tensor]:
-    """Exclude a frozen PE backbone that is already identified by config/checkpoint path."""
+    """Exclude the frozen 1B backbone already identified by path and SHA256."""
     state = model.state_dict()
-    pe_extractor = getattr(model, "pe_extractor", None)
-    if pe_extractor is not None and getattr(pe_extractor, "freeze", False):
+    feature_extractor = getattr(model, "feature_extractor", None)
+    if feature_extractor is not None and getattr(feature_extractor, "freeze", False):
         state = {
-            key: value for key, value in state.items() if not key.startswith("pe_extractor.model.")
+            key: value
+            for key, value in state.items()
+            if not key.startswith("feature_extractor.model.")
         }
     return state
 
 
+def _load_camera_window(paths_json: str, config: dict[str, Any]) -> Tensor:
+    paths = json.loads(paths_json)
+    backbone = config["vision_backbone"]
+    transform = VGGTOmegaResize(
+        image_resolution=int(backbone["image_resolution"]),
+        mode=str(backbone["resize_mode"]),
+        patch_size=int(backbone["patch_size"]),
+    )
+    frames = []
+    for path in paths:
+        with Image.open(path) as image:
+            frames.append(transform(image))
+    return torch.stack(frames)
+
+
 class TokenizerTrainer:
-    """Train the online-PE + tokenizer model and log auditable scalar terms."""
+    """Train the cached or online VGGT-Omega action tokenizer."""
 
     def __init__(
         self,
@@ -68,13 +87,10 @@ class TokenizerTrainer:
         self.precision = precision
         self.grad_clip_norm = grad_clip_norm
         self.config = config or {}
-        self.sample_posterior = bool(
-            self.config.get("train", {}).get("sample_posterior", True)
-        )
         self.global_step = 0
         self.best_ade = math.inf
-        self.scaler = torch.cuda.amp.GradScaler(
-            enabled=precision == "fp16" and context.device.type == "cuda"
+        self.scaler = torch.amp.GradScaler(
+            "cuda", enabled=precision == "fp16" and context.device.type == "cuda"
         )
         tensorboard_config = self.config.get("tensorboard", {})
         self.eval_visualization_items = int(
@@ -158,14 +174,14 @@ class TokenizerTrainer:
             self.optimizer.zero_grad(set_to_none=True)
             with self._autocast():
                 model_inputs = {
-                    "trajectory": batch["trajectory"],
                     "frame_times": batch["frame_times"],
                     "future_times": batch["future_times"],
-                    "trajectory_mask": batch["trajectory_mask"],
-                    "sample_posterior": self.sample_posterior,
                 }
-                feature_key = "visual_features" if "visual_features" in batch else "images"
-                model_inputs[feature_key] = batch[feature_key]
+                if "camera_hidden" in batch:
+                    model_inputs["camera_hidden"] = batch["camera_hidden"]
+                    model_inputs["register_hidden_mean"] = batch["register_hidden_mean"]
+                else:
+                    model_inputs["images"] = batch["images"]
                 output = self.model(**model_inputs)
                 loss, terms = self.loss_module(
                     output,
@@ -216,14 +232,14 @@ class TokenizerTrainer:
             batch = _to_device(raw_batch, self.context.device)
             with self._autocast():
                 model_inputs = {
-                    "trajectory": batch["trajectory"],
                     "frame_times": batch["frame_times"],
                     "future_times": batch["future_times"],
-                    "trajectory_mask": batch["trajectory_mask"],
-                    "sample_posterior": False,
                 }
-                feature_key = "visual_features" if "visual_features" in batch else "images"
-                model_inputs[feature_key] = batch[feature_key]
+                if "camera_hidden" in batch:
+                    model_inputs["camera_hidden"] = batch["camera_hidden"]
+                    model_inputs["register_hidden_mean"] = batch["register_hidden_mean"]
+                else:
+                    model_inputs["images"] = batch["images"]
                 output = self.model(**model_inputs)
                 _, terms = self.loss_module(
                     output,
@@ -234,10 +250,13 @@ class TokenizerTrainer:
                 )
                 terms.update(
                     trajectory_metrics(
-                        output.reconstruction_vis,
+                        output.reconstruction,
                         batch["trajectory"],
                         batch["future_times"],
                         batch["trajectory_mask"],
+                        steps_per_token=int(
+                            self.config["action_tokenizer"]["steps_per_token"]
+                        ),
                     )
                 )
             if render_visualizations and visualization_count < self.eval_visualization_items:
@@ -253,15 +272,18 @@ class TokenizerTrainer:
                         and scene_token in visualized_scenes
                     ):
                         continue
-                    camera_images = (
-                        batch.get("images", [None] * batch_size)[item_index]
-                        if self.eval_visualization_include_images
-                        else None
-                    )
-                    image = render_evaluation_diagnostic(
+                    camera_images = None
+                    if self.eval_visualization_include_images:
+                        if "images" in batch:
+                            camera_images = batch["images"][item_index]
+                        else:
+                            camera_images = _load_camera_window(
+                                batch["image_paths_json"][item_index], self.config
+                            )
+                    image = render_vggt_evaluation_diagnostic(
                         batch["trajectory"][item_index],
-                        output.reconstruction_vis[item_index],
-                        output.reconstruction_traj[item_index],
+                        output.reconstruction[item_index],
+                        output.predicted_increments[item_index],
                         batch["future_times"][item_index],
                         camera_images=camera_images,
                         frame_times=batch["frame_times"][item_index],
@@ -270,7 +292,7 @@ class TokenizerTrainer:
                     )
                     assert self.writer is not None
                     self.writer.add_image(
-                        f"evaluation/diagnostic_2x2/item_{visualization_count:03d}",
+                        f"evaluation/vggt_diagnostic_2x2/item_{visualization_count:03d}",
                         image,
                         self.global_step,
                     )
@@ -309,7 +331,9 @@ class TokenizerTrainer:
         model = _unwrap(self.model)
         incompatible = model.load_state_dict(checkpoint["model"], strict=False)
         invalid_missing = [
-            key for key in incompatible.missing_keys if not key.startswith("pe_extractor.model.")
+            key
+            for key in incompatible.missing_keys
+            if not key.startswith("feature_extractor.model.")
         ]
         if invalid_missing or incompatible.unexpected_keys:
             raise RuntimeError(

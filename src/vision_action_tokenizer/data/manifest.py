@@ -227,7 +227,9 @@ class ManifestBuilder:
                 matched_trajectory_poses, matched_timestamps_us, current_trajectory_errors = sampled
                 if any(
                     right <= left
-                    for left, right in zip(matched_timestamps_us, matched_timestamps_us[1:])
+                    for left, right in zip(
+                        matched_timestamps_us, matched_timestamps_us[1:], strict=False
+                    )
                 ):
                     rejected["duplicate_trajectory_pose"] += 1
                     continue

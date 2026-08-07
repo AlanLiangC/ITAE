@@ -1,10 +1,21 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 import numpy as np
+import pytest
+import torch
 from PIL import Image
+from safetensors.torch import save_file
+from vggt_omega.utils.load_fn import load_and_preprocess_images
 
+from vision_action_tokenizer.data.dataset import (
+    CachedVGGTOmegaFeatureDataset,
+    NuScenesWindowDataset,
+    VGGTOmegaResize,
+)
 from vision_action_tokenizer.data.geometry import (
     interpolate_pose_at_timestamp,
     make_transform,
@@ -13,6 +24,7 @@ from vision_action_tokenizer.data.geometry import (
 from vision_action_tokenizer.data.lidar import LidarPoseRecord
 from vision_action_tokenizer.data.manifest import (
     ManifestBuilder,
+    WindowRecord,
     manifest_scene_tokens,
     save_manifest,
 )
@@ -25,6 +37,67 @@ def test_pose_to_local_trajectory() -> None:
     future = make_transform([1, 0, 0, 0], [13, 22, 0])
     trajectory = poses_to_local_trajectory(anchor, [future])
     np.testing.assert_allclose(trajectory[0], [3, 2, 0], atol=1e-6)
+
+
+def test_vggt_transform_matches_official_max_size(tmp_path: Path) -> None:
+    image_path = tmp_path / "front.png"
+    array = np.arange(90 * 160 * 3, dtype=np.uint8).reshape(90, 160, 3)
+    Image.fromarray(array).save(image_path)
+    official = load_and_preprocess_images(
+        [str(image_path)], mode="max_size", image_resolution=512, patch_size=16
+    )[0]
+    with Image.open(image_path) as image:
+        project = VGGTOmegaResize(512, "max_size", 16)(image)
+    assert project.shape == (3, 288, 512)
+    assert torch.allclose(project, official)
+
+
+def test_vggt_cache_rejects_incomplete_and_corrupt_shards(tmp_path: Path) -> None:
+    record = WindowRecord(
+        sample_token="sample",
+        scene_token="scene",
+        anchor_timestamp_us=0,
+        image_paths=[],
+        image_timestamps_us=[],
+        frame_times_s=[0, 1, 2, 3, 4],
+        trajectory=[[0.0, 0.0, 0.0]] * 40,
+        future_times_s=[step / 10 for step in range(1, 41)],
+        max_image_time_error_us=0,
+        max_trajectory_time_error_us=0,
+    )
+    base = NuScenesWindowDataset([record], load_images=False)
+    shard = tmp_path / "features_00000.safetensors"
+    save_file(
+        {
+            "camera_hidden": torch.zeros(1, 5, 8),
+            "register_hidden_mean": torch.zeros(1, 5, 8),
+            "pose_enc": torch.zeros(1, 5, 9),
+        },
+        shard,
+    )
+    index = {
+        "cache_type": "vggt_omega_camera_head_hidden_v1",
+        "num_samples": 1,
+        "complete": False,
+        "shards": [
+            {
+                "file": shard.name,
+                "start": 0,
+                "end": 1,
+                "sha256": hashlib.sha256(shard.read_bytes()).hexdigest(),
+            }
+        ],
+    }
+    (tmp_path / "index.json").write_text(json.dumps(index), encoding="utf-8")
+    with pytest.raises(ValueError, match="incomplete"):
+        CachedVGGTOmegaFeatureDataset(base, tmp_path)
+
+    index["complete"] = True
+    (tmp_path / "index.json").write_text(json.dumps(index), encoding="utf-8")
+    shard.write_bytes(shard.read_bytes() + b"corrupt")
+    dataset = CachedVGGTOmegaFeatureDataset(base, tmp_path)
+    with pytest.raises(ValueError, match="checksum"):
+        dataset[0]
 
 
 def test_pose_interpolation_uses_shortest_rotation() -> None:

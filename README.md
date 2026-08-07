@@ -1,314 +1,186 @@
-# Vision-Aligned Action Tokenizer
+# ITAE: VGGT-Omega Vision Action Tokenizer
 
-面向端到端自动驾驶 action expert 的视觉对齐连续动作 tokenizer。默认配置把 4 s 输入
-视觉窗口内 `(t0, t0+4s]` 的 `[40, 3] = [x, y, yaw]` 自车轨迹编码为 `[10, 64]`
-action tokens，并让 latent 同时满足：
-
-- 可从当前到未来的 PE-Spatial 视觉状态转移中提取；
-- 可由纯轨迹编码器得到，并与视觉 latent 对齐；
-- 不依赖任何视觉旁路，能够由 `Decoder(Z)` 独立还原轨迹；
-- 可作为 diffusion/flow action expert 的生成目标。
-
-当前版本包括：
-
-- MMDetection3D 新旧格式及自定义 12 Hz nuScenes info 适配；
-- 5 帧官方 CAM_FRONT keyframe `[0, 1, 2, 3, 4] s` 视觉窗口；
-- 官方 `LIDAR_TOP sample_data -> ego_pose` 构建的 40 点、10 Hz 实测轨迹；
-- `PE-Spatial-B16-512` patch-token 提取与离线缓存；
-- 保留二维网格顺序的视觉转移编码器、轨迹编码器、共享无上下文 decoder；
-- direct 和可微 unicycle 两种 trajectory head；
-- 重建、动力学、物理、KL、跨模态对齐、视觉转移损失；
-- latent diffusion action expert；
-- L0 log replay 与 L1 kinematic rollout 接口；
-- 数据审计、manifest、训练、latent 导出与测试工具。
-
-## 1. 核心数据流
-
-Tokenizer 训练：
+ITAE 将 nuScenes 的 5 张 `CAM_FRONT` keyframe（0–4 s、1 Hz）编码成 4 个相邻时间段的
+action token，再从 token 重建输入视觉窗口内的 40 个 LiDAR ego pose（0.1–4.0 s、10 Hz）。
 
 ```text
-5 images -> frozen PE -> same-grid temporal delta -> z_vis ---+
-                                                              +-> shared Decoder(z) -> trajectory
-GT trajectory -----------> trajectory encoder -> z_traj -----+
-                              z_vis -> stop-grad(z_traj) alignment
+5 × CAM_FRONT
+  -> frozen VGGT-Omega Aggregator + CameraHead trunk
+  -> 5 × frame geometry
+  -> 4 × 128-D interval action token
+  -> context-free SE(2) increment decoder
+  -> 40 × [x forward, y left, yaw]
 ```
 
-Action expert 推理：
+轨迹不是“视觉窗口之后的未来”：anchor 是第 1 张图，40 点覆盖 5 张输入图之间的同一段 4 s
+时间。图像来自 1 Hz keyframe；轨迹来自 10 Hz LiDAR keyframe/sweep 的标定后 ego pose。
+
+## 环境与权重
+
+当前验证环境：
+
+- conda：`py312torch210cu126`
+- Python 3.12.13、PyTorch 2.10.0+cu126
+- GPU：RTX 4070 Laptop 8 GB
+- VGGT-Omega checkpoint：
+  `/home/alan/AlanLiang/Projects/pure_checkpoints/VGGT-Omega/vggt_omega_1b_512.pt`
+- checkpoint SHA256：
+  `c02da418b18bb01d0392598d3f6147366bcde1bb70fd08a5e3bf7925b0667934`
+
+安装：
+
+```bash
+conda activate py312torch210cu126
+python -m pip install -e third_party/vggt-omega
+python -m pip install -e ".[dev,viz]"
+```
+
+`third_party/vggt-omega` 使用 FAIR Noncommercial Research License，并带有 Acceptable Use
+Policy。使用、发布 checkpoint 或衍生权重前，请确认当前自动驾驶研究用途满足其许可证要求。
+
+## 数据与配置
+
+正式配置是
+[`configs/nuscenes_vggt_omega_front_4s.yaml`](configs/nuscenes_vggt_omega_front_4s.yaml)。
+以下 setting 都可在 YAML 中修改：
+
+- `data.frame_offsets_s`：视觉帧时间，默认 `[0,1,2,3,4]`；
+- `data.future_horizon_s` / `trajectory_hz`：默认 4 s / 10 Hz；
+- 图像与 LiDAR 时间误差、插值上限、采样策略；
+- VGGT resize、checkpoint 与 cache 路径；
+- action token 数量/维度、每个 token 的轨迹步数、decoder 维度；
+- 四项 loss 权重、训练和 TensorBoard 设置。
+
+已有 manifest：
 
 ```text
-current/history condition tokens -> latent diffusion expert -> z_hat
-z_hat -> frozen Decoder -> [40, 3] trajectory
+data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl  # 19,370
+data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl    #  4,017
 ```
 
-未来图像只用于 tokenizer teacher 的训练和离线 latent target 导出。部署时 decoder 不读取
-PE context、图像或未来信息。
-
-## 2. 安装
-
-建议使用 Python 3.10+、PyTorch 2.2+ 和 CUDA 环境：
-
-```bash
-cd vision_action_tokenizer
-pip install -e ".[dev,viz]"
-```
-
-安装 Meta PE 官方代码：
-
-```bash
-git clone https://github.com/facebookresearch/perception_models.git third_party/perception_models
-pip install -e third_party/perception_models
-```
-
-首次运行 PE 时会按官方逻辑下载 checkpoint；也可以通过环境已有的 Hugging Face 缓存读取。
-本地权重可直接写入配置，不会再次联网下载：
-
-```yaml
-pe:
-  model_name: PE-Spatial-B16-512
-  checkpoint_path: /path/to/PE-Spatial-B16-512.pt
-  forward_batch_size: 6
-```
-
-`forward_batch_size` 是 PE 内部的图像分块大小，不改变训练 batch；8 GB 显卡建议从 6
-开始。本项目的 PE 预处理使用官方 `mean=std=[0.5, 0.5, 0.5]`，同时按项目设计采用
-letterbox 保留前视相机完整横向视野。
-
-## 3. 数据准备
-
-假设已有：
-
-```text
-nuscenes_interp_12Hz_infos_train.pkl
-nuscenes_interp_12Hz_infos_val.pkl
-```
-
-### 3.1 先审计真实 schema
-
-```bash
-python tools/inspect_infos.py \
-  --info /path/to/nuscenes_interp_12Hz_infos_train.pkl \
-  --data-root /path/to/nuscenes
-```
-
-该命令只读 pkl，输出：外层结构、样本字段、相机字段、scene 数、时间间隔、路径缺失和
-pose 解析情况。只加载可信来源的 pickle 文件。
-
-### 3.2 构建版本化 manifest
+如需重建 manifest：
 
 ```bash
 python tools/build_manifest.py \
-  --config configs/nuscenes_lidar10hz_front_4s.yaml \
-  --info /path/to/nuscenes_interp_12Hz_infos_train.pkl \
-  --output data/manifests/train.jsonl \
-  --report data/manifests/train_report.json
+  --config configs/nuscenes_vggt_omega_front_4s.yaml \
+  --info data/nuscenes/nuscenes_interp_12Hz_infos_train.pkl \
+  --output data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
+  --report data/manifests/nuscenes_lidar10hz_front_4s_train.report.json
 ```
 
-默认定义：
+## 1. 先审计 VGGT 相机运动
 
-- teacher images：5 张官方 CAM_FRONT keyframe，目标时间为 `t0 + [0,1,2,3,4] s`；
-- trajectory：从官方 LiDAR keyframe+sweeps 最近邻抽取视觉窗口内
-  `t0 + [0.1,...,4.0] s`，共 40 点；`t0` 恒为局部坐标原点，故不重复保存；
-- anchor stride：默认使用每个官方 keyframe，可通过 `anchor_stride_s` 降采样；
-- 坐标系：anchor ego frame，`x` 向前、`y` 向左、yaw 逆时针为正。
-
-两个时间轴相互独立：图像只从 pkl 中 32 位官方 token 对应的 keyframe 选择；轨迹不再
-使用 12 Hz pkl 的插值 pose，而是流式读取官方 nuScenes 的 `sample_data.json`、
-`ego_pose.json` 和 `calibrated_sensor.json`。默认 `trajectory_sampling: nearest` 直接使用
-LiDAR 实测 ego pose，不做 SE(3) 插值。轨迹中的每个 `future_times_s` 保存实际 sweep
-时间；所有导数都使用这个真实时间。实测当前数据的 LIDAR_TOP 原始间隔约 49.8 ms
-（约 20 Hz），默认配置按 10 Hz 目标时间抽取 40 点。
-
-注意：`ego_pose` 定义车辆位姿，`calibrated_sensor` 定义 LiDAR 到 ego 的固定外参；两者
-都会解析并校验，但自车轨迹应由 `ego_pose` 构造，不能把 `sensor2ego` 误当成车辆运动。
-以下数据设置全部可在 YAML 中修改：
-
-```yaml
-data:
-  image_source: keyframe
-  frame_offsets_s: [0, 1, 2, 3, 4]
-  max_image_time_error_s: 0.25
-  trajectory_pose_source: lidar_sweeps
-  trajectory_sampling: nearest
-  future_horizon_s: 4.0
-  trajectory_hz: 10
-  max_trajectory_time_error_s: 0.03
-  max_pose_interpolation_gap_s: 0.15
-  anchor_stride_s: 0.0
-```
-
-### 3.3 抽查样本
+在训练前必须检查 pose 的方向、frame order 和尺度：
 
 ```bash
-python tools/visualize_samples.py \
-  --manifest data/manifests/train.jsonl \
-  --output outputs/sample_check.png \
-  --count 4
+python tools/inspect_vggt_camera_motion.py \
+  --config configs/nuscenes_vggt_omega_front_4s.yaml \
+  --manifest data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
+  --output-dir output/vggt_camera_motion_audit/train
+
+python tools/inspect_vggt_camera_motion.py \
+  --config configs/nuscenes_vggt_omega_front_4s.yaml \
+  --manifest data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl \
+  --calibration output/vggt_camera_motion_audit/train/camera_motion_calibration.json \
+  --output-dir output/vggt_camera_motion_audit/val
 ```
 
-正式训练前应人工检查图像顺序、轨迹朝向和 4 s 覆盖。
+脚本会自动选静止、约 20 m、长直行和大转弯样本，输出 contact sheet、BEV 对照和 JSON。
+第一条命令仅在 train 样本上拟合一个全局 scale，第二条将其原样用于 val，禁止逐 val window
+对齐。此前 4 个 val 诊断样本的 translation direction cosine 为 `0.978`；该 pose 尺度只用于
+表征审计，不会泄漏到 tokenizer。
 
-也可以生成连续 CAM_FRONT 视频，把每一帧的 4 s / 40 点 LiDAR GT 轨迹直接投影到主视图：
+轨迹点本身可继续用原始视频投影工具检查：
 
 ```bash
-python tools/visualize_trajectory_video.py \
-  --config configs/nuscenes_lidar10hz_front_4s.yaml \
-  --info data/nuscenes/nuscenes_interp_12Hz_infos_val.pkl \
-  --output outputs/trajectory_projection/val_lidar10hz_4s.mp4
+python tools/visualize_trajectory_video.py --help
 ```
 
-视频左下角颜色由近到远，右下角同时显示 `x 向前、y 向左` 的 BEV。配套 JSON 会记录
-LiDAR pose 最近邻距离、可见投影点数量以及 local/global 两条解析路径的一致性误差。
+## 2. 缓存冻结的 VGGT 特征
 
-## 4. 训练 tokenizer
-
-默认配置位于 `configs/nuscenes_lidar10hz_front_4s.yaml`。最小训练命令：
+1B backbone 不参与常规 tokenizer 反向；先分别缓存 train/val：
 
 ```bash
-/home/alan/miniconda3/envs/openmmlab/bin/torchrun \
-  --standalone --nproc_per_node=1 tools/train_tokenizer.py \
-  --config configs/nuscenes_lidar10hz_front_4s.yaml \
+python tools/cache_vggt_omega_features.py \
+  --config configs/nuscenes_vggt_omega_front_4s.yaml \
+  --manifest data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
+  --output data/vggt_omega_cache/nuscenes_front_4s_train \
+  --shard-size 128 --num-workers 2
+
+python tools/cache_vggt_omega_features.py \
+  --config configs/nuscenes_vggt_omega_front_4s.yaml \
+  --manifest data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl \
+  --output data/vggt_omega_cache/nuscenes_front_4s_val \
+  --shard-size 128 --num-workers 2
+```
+
+每个样本缓存 CameraHead trunk 后的 `camera_hidden [5,2048]`、register mean 和 pose。
+`index.json` 固定 manifest/checkpoint/preprocess/third-party commit；每个 shard 有 SHA256。中断后用
+同一命令可从最后一个已校验 shard 继续；metadata 或 shard checksum 不一致会直接报错。
+
+本机实测约 3.2 windows/s，完整 23,387 个窗口约需 2 小时。
+
+## 3. 训练与自动恢复
+
+```bash
+torchrun --standalone --nproc_per_node=1 \
+  tools/train_tokenizer.py \
+  --config configs/nuscenes_vggt_omega_front_4s.yaml \
   --train-manifest data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
   --val-manifest data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl \
-  --output output/itae_v2_tokenizer
+  --output output/itae_vggt_omega_v1
 ```
 
-多卡时修改 `--nproc_per_node`。训练脚本支持 DDP、BF16/FP16、断点恢复、梯度裁剪和
-配置/manifest hash 记录。默认同时把每步训练 loss、学习率、梯度范数、每轮验证指标和
-BEV 轨迹重建对比写入 `<output>/tensorboard`：
+默认 `train.resume: auto`：同一 output 下自动选修改时间最新的 `.pt`，恢复 model、optimizer、
+scheduler、AMP scaler、epoch、global step 和 RNG。也可在 YAML 写 checkpoint 路径，或用
+`--resume PATH`；`--no-resume` 强制新训练。旧 PE V2 checkpoint 与新图严格不兼容。
+
+TensorBoard：
 
 ```bash
-tensorboard --logdir output/itae_v2_tokenizer/tensorboard --port 6006
+tensorboard --logdir output/itae_vggt_omega_v1/tensorboard --port 6006
 ```
 
-默认 `train.resume: auto`：启动时扫描 `--output` 目录下的 `*.pt`，按修改时间自动恢复
-最新的完整 checkpoint（包含模型、optimizer、scheduler、scaler、epoch、global step 和
-随机数状态）。也可以在 config 中指定文件；相对文件名会在 output 目录内查找：
+训练会记录各 loss、ADE/FDE/yaw、运动导数、LR、gradient norm 和 action token
+std/cosine。evaluation 按配置抽样生成 1200×900 的 2×2 页面：五张主视图、GT BEV、重建
+BEV，以及逐时刻 position/body-increment error。即便训练读取 cache，val dataset 仍会为这些
+页面读取原始图像。
 
-```yaml
-train:
-  resume: auto                       # 自动选择 output 中最新 checkpoint
-  # resume: last.pt                 # output/last.pt
-  # resume: /abs/path/checkpoint.pt # 明确路径
-  # resume: null                    # 禁止自动恢复
-```
-
-命令行 `--resume /path/to/checkpoint.pt` 的优先级最高；临时强制从头训练可加
-`--no-resume`。若自动扫描的 output 目录为空，会打印提示并正常从 epoch 0 开始。
-
-当前 V2 的维度、resampler、visual transition 和 decoder 都与早期
-`output/itae_debug_tokenizer` 权重不兼容。首次训练必须使用新的 output（如上面的
-`output/itae_v2_tokenizer`）；之后同一目录会继续自动恢复。V2 默认先训练 500 step 的轨迹
-codec，再用 1000 step 渐进打开视觉重建/对齐；训练时可在 TensorBoard 的
-`train/loss/visual_scale` 确认阶段是否符合预期。
-
-验证可视化数量和频率由配置控制。每个 item 是一个 2×2 诊断页：左上显示 5 帧
-CAM_FRONT 输入，其余三个面板分别是 GT、visual-latent reconstruction 和
-trajectory-latent reconstruction 的共享尺度 BEV；绿→黄→红表示窗口内时间由近到远，
-重建面板中的灰色虚线是 GT。默认从不同 scene 各取一个固定 item，避免连续窗口重复，并
-确保不同 epoch 可在同一 TensorBoard image tag 下比较：
-
-```yaml
-tensorboard:
-  enabled: true
-  log_dir: null
-  flush_secs: 30
-  evaluation_visualization_items: 8
-  evaluation_visualization_every_epochs: 1
-  evaluation_visualization_include_images: true
-  evaluation_visualization_distinct_scenes: true
-```
-
-即使训练使用离线 PE feature cache，验证集也会在需要可视化的 item 上读取原始主视图；若
-希望完全跳过图像 I/O，可将 `evaluation_visualization_include_images: false`。
-图像写入 TensorBoard 的 `evaluation/diagnostic_2x2/item_*`，同一个 tag 在不同 epoch
-保持不变，便于拖动 step 对照输入场景和重建轨迹的变化。
-
-建议按以下顺序验证：
-
-1. `--overfit-samples 64`，确认数据、坐标和 decoder 能过拟合；
-2. 保持 `sample_posterior: false`、`kl_weight: 0`，先验证 deterministic codec；
-3. 观察 `train/posterior/visual_offdiag_cosine`，不能长期接近 1；
-4. 基线稳定后再单独消融 KL 或 kinematic decoder，不要直接恢复 V1 checkpoint。
-
-独立评估命令：
+## 4. 评估与 action latent 导出
 
 ```bash
 python tools/evaluate_tokenizer.py \
-  --config configs/nuscenes_lidar10hz_front_4s.yaml \
-  --manifest data/manifests/val.jsonl \
-  --checkpoint outputs/tokenizer/best.pt \
-  --output outputs/tokenizer/val_metrics.json
-```
+  --config configs/nuscenes_vggt_omega_front_4s.yaml \
+  --manifest data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl \
+  --train-manifest data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
+  --pose-calibration output/vggt_camera_motion_audit/train/camera_motion_calibration.json \
+  --checkpoint output/itae_vggt_omega_v1/best.pt \
+  --output output/itae_vggt_omega_v1/val_metrics.json
 
-独立 evaluation 同样会把 scalar 和 BEV item 写到输出 JSON 同级的 `tensorboard_eval/`；
-可用 `--tensorboard-dir <path>` 与 `--visualize-items <N>` 覆盖目录和抽样数量。
-
-## 5. PE 特征缓存
-
-PE 冻结时可离线缓存 patch tokens：
-
-```bash
-python tools/cache_pe_features.py \
-  --config configs/nuscenes_lidar10hz_front_4s.yaml \
-  --manifest data/manifests/train.jsonl \
-  --output data/pe_cache/train \
-  --shard-size 128
-```
-
-每个 safetensors shard 带 checkpoint、层号、图像变换和 manifest hash。训练时配置
-`data.feature_cache` 即可跳过 PE 前向。train/val 使用不同缓存时写成：
-
-```yaml
-data:
-  feature_cache:
-    train: data/pe_cache/train
-    val: data/pe_cache/val
-```
-
-## 6. 导出 action latent
-
-```bash
 python tools/export_action_latents.py \
-  --config configs/nuscenes_lidar10hz_front_4s.yaml \
-  --manifest data/manifests/train.jsonl \
-  --checkpoint outputs/tokenizer/best.pt \
-  --output data/action_latents/train.safetensors
+  --config configs/nuscenes_vggt_omega_front_4s.yaml \
+  --manifest data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
+  --checkpoint output/itae_vggt_omega_v1/best.pt \
+  --output output/itae_vggt_omega_v1/train_action_tokens.safetensors
 ```
 
-默认导出稳定的 posterior mean `mu_vis`，同时保存仅由 train split 估计的 latent
-normalizer。action expert 训练和 decoder 推理必须使用同一 normalizer/checkpoint hash。
+评估 JSON 同时报告 tokenizer、始终静止、train-mean、train-calibrated VGGT pose 四组结果，
+并按 stationary / straight slow / straight fast / turn 分桶。train manifest 与 pose calibration
+都只作为固定 baseline，绝不在 val 上重新拟合。
 
-## 7. 闭环等级
+导出的 latent shape 为 `[N,4,128]`，并包含训练 action expert 所需的 mean/std。decoder 只读取
+action tokens 与 query 时间，不读取图像、VGGT hidden 或 GT。
 
-- **L0**：每 0.5 s 读取新的 logged observation 并重规划，只称为 pseudo closed-loop；
-- **L1**：执行预测轨迹，使用 unicycle/kinematic tracker 推进 ego，其他 agents 日志回放；
-- **L2**：预留 CARLA 或 world-model sensor-in-the-loop adapter，本版本不把 L0/L1 结果
-  宣称为真实视觉闭环。
+## 验证状态
 
-## 8. 测试
+- 官方 VGGT `max_size` 预处理逐像素一致；
+- camera branch checkpoint strict load 与 5 帧 BF16 forward 通过；
+- 单窗口峰值显存约 6.02 GB；
+- trainable adapter + decoder：1,657,476 参数；
+- 4 类样本 overfit：500 step ADE `0.221 m`，最终 `0.117 m`；
+- 随机 64 样本 overfit：750 step ADE `0.449 m`；
+- `torchrun` 保存、自动恢复、TensorBoard 标量和 2×2 图片已做端到端 smoke test；
+- 运行 `python -m pytest -q` 和 `python -m ruff check src tests tools` 做回归检查。
 
-```bash
-pytest
-ruff check src tools tests
-```
-
-测试覆盖 SE(2) 坐标转换、时间窗口、导数与 mask、视觉/轨迹 encoder、两种 decoder、
-完整 tokenizer loss、latent diffusion 以及 L0/L1 状态推进。
-
-## 9. 关键接口
-
-```python
-# 视觉 teacher，仅在 tokenizer 训练/target 导出时使用。
-out = tokenizer(
-    visual_features=pe_tokens,       # [B, 5, N, C_pe]
-    trajectory=trajectory,           # [B, 40, 3]
-    frame_times=frame_times,         # [B, 5]
-    future_times=future_times,       # [B, 40]
-)
-
-# 部署：decoder 不需要当前 PE context。
-trajectory_hat = tokenizer.decode(action_tokens_hat, future_times)
-```
-
-所有公开张量接口的 docstring 都注明 shape、单位、坐标系和 mask 语义。关键几何、时间
-匹配、物理积分与防止信息泄漏的位置均有代码注释。
+VS Code 已提供 camera audit、val cache、train、evaluation 和当前文件五个 debug configuration，
+解释器均指向 `py312torch210cu126`。

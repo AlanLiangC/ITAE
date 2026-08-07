@@ -1,4 +1,4 @@
-"""Build consistently configured model graphs for train/export tools."""
+"""Build the VGGT-Omega interval action tokenizer consistently across tools."""
 
 from __future__ import annotations
 
@@ -6,52 +6,69 @@ from typing import Any
 
 from torch import nn
 
-from .pe import CachedVisionActionTrainingModel, PEFeatureExtractor, VisionActionTrainingModel
 from .tokenizer import VisionActionTokenizer
+from .vggt_omega import (
+    CachedOmegaTrainingModel,
+    OmegaCameraFeatureExtractor,
+    OnlineOmegaTrainingModel,
+)
 
 
 def build_tokenizer(config: dict[str, Any]) -> VisionActionTokenizer:
-    model = config["model"]
-    pe = config["pe"]
+    action = config["action_tokenizer"]
+    backbone = config["vision_backbone"]
+    if backbone.get("type") != "vggt_omega":
+        raise ValueError("vision_backbone.type must be `vggt_omega`")
+    if action.get("decoder_type") != "se2_increment":
+        raise ValueError("action_tokenizer.decoder_type must be `se2_increment`")
+    num_frames = int(action["num_frames"])
+    num_tokens = int(action["num_action_tokens"])
+    if num_tokens != num_frames - 1:
+        raise ValueError("num_action_tokens must equal num_frames - 1")
+    configured_frame_count = len(config["data"]["frame_offsets_s"])
+    if configured_frame_count != num_frames:
+        raise ValueError("action_tokenizer.num_frames must match data.frame_offsets_s")
+    trajectory_steps = round(
+        float(config["data"]["future_horizon_s"])
+        * int(config["data"]["trajectory_hz"])
+    )
+    if num_tokens * int(action["steps_per_token"]) != trajectory_steps:
+        raise ValueError(
+            "num_action_tokens * steps_per_token must match horizon * trajectory_hz"
+        )
     return VisionActionTokenizer(
-        pe_feature_dim=int(pe["feature_dim"]),
-        model_dim=int(model["model_dim"]),
-        latent_dim=int(model["latent_dim"]),
-        num_action_tokens=int(model["num_action_tokens"]),
-        resampled_tokens_per_frame=int(model["resampled_tokens_per_frame"]),
-        num_heads=int(model["num_heads"]),
-        encoder_layers=int(model["encoder_layers"]),
-        decoder_layers=int(model["decoder_layers"]),
-        dropout=float(model["dropout"]),
-        decoder_type=str(model["decoder_type"]),
-        num_visual_frames=len(config["data"]["frame_offsets_s"]),
-        max_speed_mps=float(model["max_speed_mps"]),
-        trajectory_position_scale_m=float(model.get("trajectory_position_scale_m", 50.0)),
-        resampler_type=str(model.get("resampler_type", "grid")),
-        visual_transition_mode=str(
-            model.get("visual_transition_mode", "spatial_difference")
-        ),
+        vggt_feature_dim=int(backbone.get("feature_dim", 2048)),
+        frame_geometry_dim=int(action["frame_geometry_dim"]),
+        action_token_dim=int(action["action_token_dim"]),
+        num_action_tokens=num_tokens,
+        steps_per_token=int(action["steps_per_token"]),
+        decoder_hidden_dim=int(action["decoder_hidden_dim"]),
+        dropout=float(action["dropout"]),
     )
 
 
-def build_training_model(config: dict[str, Any], cached: bool = False) -> nn.Module:
+def build_training_model(config: dict[str, Any], cached: bool = True) -> nn.Module:
     tokenizer = build_tokenizer(config)
     if cached:
-        return CachedVisionActionTrainingModel(tokenizer)
-    pe_config = config["pe"]
-    extractor = PEFeatureExtractor(
-        model_name=str(pe_config["model_name"]),
-        checkpoint_path=pe_config.get("checkpoint_path"),
-        layer_idx=pe_config.get("layer_idx"),
-        pool_size=int(pe_config["pool_size"]),
-        forward_batch_size=pe_config.get("forward_batch_size"),
-        freeze=bool(pe_config.get("freeze", True)),
+        return CachedOmegaTrainingModel(tokenizer)
+    backbone = config["vision_backbone"]
+    if not bool(backbone.get("freeze_camera_trunk", True)):
+        raise NotImplementedError(
+            "CameraHead trunk fine-tuning requires the Phase-E online training path; "
+            "the current closed-loop baseline keeps it frozen"
+        )
+    if not bool(backbone.get("freeze_aggregator", True)):
+        raise NotImplementedError("The VGGT-Omega Aggregator must remain frozen")
+    extractor = OmegaCameraFeatureExtractor(
+        checkpoint_path=backbone["checkpoint_path"],
+        expected_sha256=backbone.get("checkpoint_sha256"),
+        freeze=True,
     )
-    return VisionActionTrainingModel(extractor, tokenizer)
+    return OnlineOmegaTrainingModel(extractor, tokenizer)
 
 
 def tokenizer_state_from_checkpoint(checkpoint: dict[str, Any]) -> dict[str, Any]:
-    """Extract tokenizer weights from online-PE, cached-PE or tokenizer-only checkpoints."""
+    """Extract tokenizer weights from online, cached or tokenizer-only checkpoints."""
     state = checkpoint["model"] if "model" in checkpoint else checkpoint
     prefixes = ("tokenizer.", "module.tokenizer.")
     for prefix in prefixes:

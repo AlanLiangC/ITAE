@@ -1,89 +1,87 @@
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as functional
-from torch import nn
 
-from vision_action_tokenizer.losses import LossConfig, TokenizerLoss, alignment_loss
-from vision_action_tokenizer.models.decoder import TrajectoryDecoder
-from vision_action_tokenizer.models.pe import PEFeatureExtractor
-from vision_action_tokenizer.models.resampler import SpatialResampler
-from vision_action_tokenizer.models.tokenizer import VisionActionTokenizer
-
-
-class FakePE(nn.Module):
-    def forward_features(self, images, **kwargs):
-        del kwargs
-        return images.new_ones((images.shape[0], 16, 8))
+from vision_action_tokenizer.losses import LossConfig, TokenizerLoss, trajectory_xy_loss
+from vision_action_tokenizer.models.decoder import (
+    SE2IncrementDecoder,
+    integrate_se2_increments,
+    trajectory_to_body_increments,
+)
+from vision_action_tokenizer.models.tokenizer import IntervalActionEncoder, VisionActionTokenizer
 
 
-def test_pe_wrapper_preserves_frame_dimension() -> None:
-    extractor = PEFeatureExtractor(model=FakePE(), pool_size=2)
-    output = extractor(torch.randn(2, 6, 3, 16, 16))
-    assert output.shape == (2, 6, 4, 8)
+def test_se2_increment_round_trip() -> None:
+    increments = torch.randn(3, 40, 3) * torch.tensor([0.5, 0.1, 0.03])
+    trajectory = integrate_se2_increments(increments)
+    recovered = trajectory_to_body_increments(trajectory)
+    assert torch.allclose(recovered, increments, atol=1e-5)
 
 
-def test_context_free_decoders() -> None:
-    latent = torch.randn(2, 2, 8)
-    times = torch.arange(1, 13).float().unsqueeze(0).repeat(2, 1) / 12
-    for decoder_type in ("direct", "kinematic"):
-        decoder = TrajectoryDecoder(
-            latent_dim=8,
-            model_dim=32,
-            num_heads=4,
-            num_layers=1,
-            dropout=0,
-            decoder_type=decoder_type,
-        )
-        trajectory = decoder(latent, times)
-        assert trajectory.shape == (2, 12, 3)
-        assert torch.isfinite(trajectory).all()
+def test_se2_increment_round_trip_across_pi_boundary() -> None:
+    increments = torch.zeros(1, 4, 3)
+    increments[0, :, 0] = 1.0
+    increments[0, :, 2] = torch.tensor([3.10, 0.10, -0.20, -3.00])
+    recovered = trajectory_to_body_increments(integrate_se2_increments(increments))
+    assert torch.allclose(recovered, increments, atol=1e-5)
 
 
-def test_grid_resampler_keeps_patch_order() -> None:
-    resampler = SpatialResampler(4, 4, 4, 1, 0, mode="grid")
-    resampler.input_projection = nn.Identity()
-    resampler.output_norm = nn.Identity()
-    nn.init.zeros_(resampler.spatial_embedding)
-    features = torch.arange(16, dtype=torch.float32).reshape(1, 1, 4, 4)
-    assert torch.equal(resampler(features), features)
-
-
-def test_alignment_uses_stop_gradient_trajectory_teacher() -> None:
-    visual = torch.randn(3, 2, 4, requires_grad=True)
-    trajectory = torch.randn(3, 2, 4, requires_grad=True)
-    alignment_loss(visual, trajectory, temperature=0.1).backward()
-    assert visual.grad is not None
-    assert trajectory.grad is None
-
-
-def test_full_tokenizer_loss_backward() -> None:
-    tokenizer = VisionActionTokenizer(
-        pe_feature_dim=16,
-        model_dim=32,
-        latent_dim=8,
-        num_action_tokens=2,
-        resampled_tokens_per_frame=4,
-        num_heads=4,
-        encoder_layers=1,
-        decoder_layers=1,
-        dropout=0,
-        decoder_type="direct",
+def test_interval_encoder_uses_measured_frame_times() -> None:
+    torch.manual_seed(1)
+    encoder = IntervalActionEncoder(input_dim=8, frame_geometry_dim=8, action_dim=4)
+    camera = torch.randn(1, 5, 8)
+    registers = torch.randn(1, 5, 8)
+    regular = torch.tensor([[0.0, 1.0, 2.0, 3.0, 4.0]])
+    irregular = torch.tensor([[0.0, 0.8, 2.1, 2.9, 4.0]])
+    assert not torch.allclose(
+        encoder(camera, registers, regular), encoder(camera, registers, irregular)
     )
-    visual = torch.randn(3, 6, 4, 16)
-    trajectory = torch.randn(3, 12, 3)
-    frame_times = torch.tensor([[0, 1, 2, 3, 4, 5]]).repeat(3, 1).float()
-    future_times = torch.arange(1, 13).float().unsqueeze(0).repeat(3, 1) / 12
-    mask = torch.ones(3, 12, dtype=torch.bool)
-    output = tokenizer(visual, trajectory, frame_times, future_times, mask)
-    expected_transition = visual.mean(dim=2)[:, 1:] - visual.mean(dim=2)[:, :1]
-    expected_transition = functional.layer_norm(expected_transition, (visual.shape[-1],))
-    assert torch.allclose(output.target_transition, expected_transition)
-    loss, terms = TokenizerLoss(LossConfig(kl_warmup_steps=1))(
-        output, trajectory, future_times, mask, global_step=1
+
+
+def test_masked_trajectory_loss_ignores_invalid_points() -> None:
+    target = torch.zeros(1, 3, 3)
+    prediction = target.clone()
+    prediction[0, 2, :2] = 1000.0
+    mask = torch.tensor([[True, True, False]])
+    masked = trajectory_xy_loss(prediction, target, mask)
+    clean = trajectory_xy_loss(prediction[:, :2], target[:, :2], None)
+    assert torch.allclose(masked, clean)
+
+
+def test_se2_decoder_shape_and_finite_output() -> None:
+    decoder = SE2IncrementDecoder(action_dim=16, hidden_dim=32, steps_per_token=10)
+    action = torch.randn(2, 4, 16)
+    times = torch.arange(1, 41).float().unsqueeze(0).repeat(2, 1) / 10
+    trajectory, increments = decoder(action, times)
+    assert trajectory.shape == (2, 40, 3)
+    assert increments.shape == (2, 40, 3)
+    assert torch.isfinite(trajectory).all()
+
+
+def test_full_vggt_tokenizer_loss_backward() -> None:
+    tokenizer = VisionActionTokenizer(
+        vggt_feature_dim=32,
+        frame_geometry_dim=16,
+        action_token_dim=8,
+        num_action_tokens=4,
+        steps_per_token=10,
+        decoder_hidden_dim=32,
+    )
+    camera = torch.randn(3, 5, 32)
+    registers = torch.randn(3, 5, 32)
+    frame_times = torch.arange(5).float().unsqueeze(0).repeat(3, 1)
+    future_times = torch.arange(1, 41).float().unsqueeze(0).repeat(3, 1) / 10
+    target_increments = torch.randn(3, 40, 3) * torch.tensor([0.3, 0.05, 0.02])
+    trajectory = integrate_se2_increments(target_increments)
+    mask = torch.ones(3, 40, dtype=torch.bool)
+    output = tokenizer(camera, registers, frame_times, future_times)
+    assert output.action_tokens.shape == (3, 4, 8)
+    assert output.reconstruction.shape == (3, 40, 3)
+    loss, terms = TokenizerLoss(LossConfig(steps_per_token=10))(
+        output, trajectory, future_times, mask
     )
     loss.backward()
     assert torch.isfinite(loss)
-    assert "loss/alignment" in terms
-    assert "loss/visual_scale" in terms
-    assert tokenizer.visual_encoder.to_mean.weight.grad is not None
+    assert "loss/increment_xy" in terms
+    assert "action/offdiag_cosine" in terms
+    assert tokenizer.encoder.frame_projection[1].weight.grad is not None

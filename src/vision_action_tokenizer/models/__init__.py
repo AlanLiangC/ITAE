@@ -1,15 +1,13 @@
-"""Model components for visual action tokenization and latent diffusion."""
+"""Model components for VGGT-Omega action tokenization and latent diffusion."""
 
-from .decoder import TrajectoryDecoder
-from .encoders import TrajectoryEncoder, VisualTransitionEncoder
-from .pe import PEFeatureExtractor
+from .decoder import SE2IncrementDecoder, integrate_se2_increments
 from .tokenizer import TokenizerOutput, VisionActionTokenizer
+from .vggt_omega import OmegaCameraFeatureExtractor
 
 __all__ = [
-    "PEFeatureExtractor",
+    "OmegaCameraFeatureExtractor",
+    "SE2IncrementDecoder",
     "TokenizerOutput",
-    "TrajectoryDecoder",
-    "TrajectoryEncoder",
     "VisionActionTokenizer",
-    "VisualTransitionEncoder",
+    "integrate_se2_increments",
 ]

@@ -29,7 +29,7 @@ def _to_numpy(value: Tensor | np.ndarray) -> np.ndarray:
 def _draw_dashed_path(
     draw: ImageDraw.ImageDraw, points: Sequence[tuple[float, float]], fill: tuple[int, int, int]
 ) -> None:
-    for index, (left, right) in enumerate(zip(points, points[1:])):
+    for index, (left, right) in enumerate(zip(points, points[1:], strict=False)):
         if index % 2 == 0:
             draw.line((*left, *right), fill=fill, width=3)
 
@@ -37,7 +37,7 @@ def _draw_dashed_path(
 def _draw_time_colored_path(
     draw: ImageDraw.ImageDraw, points: Sequence[tuple[float, float]]
 ) -> None:
-    for index, (left, right) in enumerate(zip(points, points[1:])):
+    for index, (left, right) in enumerate(zip(points, points[1:], strict=False)):
         fraction = index / max(len(points) - 2, 1)
         draw.line((*left, *right), fill=trajectory_time_color(fraction), width=6)
     for index in range(1, len(points), max((len(points) - 1) // 8, 1)):
@@ -128,7 +128,7 @@ def render_bev_trajectory_comparison(
         plot_bottom = panel_bottom - 18 * scale
         u = plot_left + (y_max - xy[:, 1]) / (y_max - y_min) * (plot_right - plot_left)
         v = plot_top + (x_max - xy[:, 0]) / (x_max - x_min) * (plot_bottom - plot_top)
-        return list(zip(u.astype(float), v.astype(float)))
+        return list(zip(u.astype(float), v.astype(float), strict=True))
 
     endpoints = [trajectory[-1, :2] for trajectory in trajectories]
     for panel_index, title in enumerate(panel_titles):
@@ -192,8 +192,7 @@ def _camera_frame_to_image(frame: Tensor | np.ndarray) -> Image.Image:
         array = np.moveaxis(array, 0, -1)
     if array.shape[-1] != 3:
         raise ValueError(f"Expected an RGB camera frame, got {array.shape}")
-    # LetterboxNormalize maps RGB from [0,1] to [-1,1]. Also accept already
-    # display-ready tensors so the renderer remains useful outside this dataset.
+    # Accept both VGGT RGB [0,1] and legacy normalized tensors for general use.
     if float(array.min()) < -0.01:
         array = array * 0.5 + 0.5
     array = np.clip(array, 0.0, 1.0)
@@ -363,7 +362,7 @@ def render_evaluation_diagnostic(
         for trajectory in trajectories
     ]
     for trajectory_index, (position, title) in enumerate(
-        zip(panel_positions[1:], panel_titles)
+        zip(panel_positions[1:], panel_titles, strict=True)
     ):
         left, top, right, bottom = panel_box(position, title)
         plot_left = left + 26 * scale
@@ -384,7 +383,7 @@ def render_evaluation_diagnostic(
             v = top_bound + (x_max - xy[:, 0]) / (x_max - x_min) * (
                 bottom_bound - top_bound
             )
-            return list(zip(u.astype(float), v.astype(float)))
+            return list(zip(u.astype(float), v.astype(float), strict=True))
 
         origin = project(np.zeros((1, 2), dtype=np.float32))[0]
         draw.line((plot_left, origin[1], plot_right, origin[1]), fill=(65, 72, 84), width=2)
@@ -413,5 +412,137 @@ def render_evaluation_diagnostic(
         )
 
     canvas = canvas.resize((width, height), Image.Resampling.LANCZOS)
+    array = np.asarray(canvas, dtype=np.float32) / 255.0
+    return torch.from_numpy(array).permute(2, 0, 1).contiguous()
+
+
+def render_vggt_evaluation_diagnostic(
+    target: Tensor | np.ndarray,
+    reconstruction: Tensor | np.ndarray,
+    predicted_increments: Tensor | np.ndarray,
+    future_times: Tensor | np.ndarray,
+    camera_images: Tensor | np.ndarray | None,
+    frame_times: Tensor | np.ndarray | None,
+    sample_token: str = "",
+    mask: Tensor | np.ndarray | None = None,
+    width: int = 1200,
+    height: int = 900,
+) -> Tensor:
+    """Render CAM_FRONT, GT, VGGT reconstruction and temporal error in a 2x2 page."""
+    base = render_evaluation_diagnostic(
+        target,
+        reconstruction,
+        reconstruction,
+        future_times,
+        camera_images,
+        frame_times,
+        sample_token=sample_token,
+        mask=mask,
+        width=width,
+        height=height,
+    )
+    canvas = Image.fromarray(
+        np.round(base.permute(1, 2, 0).numpy() * 255).astype(np.uint8), mode="RGB"
+    )
+    draw = ImageDraw.Draw(canvas)
+    try:
+        title_font = ImageFont.truetype("DejaVuSans.ttf", 13)
+        small_font = ImageFont.truetype("DejaVuSans.ttf", 10)
+    except OSError:
+        title_font = ImageFont.load_default(size=13)
+        small_font = ImageFont.load_default(size=10)
+
+    left, top, right, bottom = 607, 473, 1182, 882
+    draw.rounded_rectangle(
+        (left, top, right, bottom),
+        radius=12,
+        fill=(27, 32, 42),
+        outline=(67, 76, 92),
+        width=1,
+    )
+    draw.text(
+        (left + 14, top + 8),
+        "Error / SE(2) increment diagnostics",
+        fill=(235, 238, 245),
+        font=title_font,
+    )
+
+    target_np = _to_numpy(target)
+    reconstruction_np = _to_numpy(reconstruction)
+    increments_np = _to_numpy(predicted_increments)
+    times_np = _to_numpy(future_times).reshape(-1)
+    if mask is not None:
+        valid = _to_numpy(mask).astype(bool).reshape(-1)
+        target_np = target_np[valid]
+        reconstruction_np = reconstruction_np[valid]
+        increments_np = increments_np[valid]
+        times_np = times_np[valid]
+    position_error = np.linalg.norm(
+        reconstruction_np[:, :2] - target_np[:, :2], axis=-1
+    )
+    origin = np.zeros((1, 3), dtype=np.float32)
+    previous = np.concatenate([origin, target_np[:-1]], axis=0)
+    global_delta = target_np[:, :2] - previous[:, :2]
+    cosine = np.cos(previous[:, 2])
+    sine = np.sin(previous[:, 2])
+    target_body_xy = np.stack(
+        [
+            cosine * global_delta[:, 0] + sine * global_delta[:, 1],
+            -sine * global_delta[:, 0] + cosine * global_delta[:, 1],
+        ],
+        axis=-1,
+    )
+    increment_error = np.linalg.norm(increments_np[:, :2] - target_body_xy, axis=-1)
+    ade = float(position_error.mean())
+    fde = float(position_error[-1])
+    increment_mae = float(increment_error.mean())
+    draw.text(
+        (left + 14, top + 31),
+        f"ADE={ade:.2f}m | FDE={fde:.2f}m | increment MAE={increment_mae:.3f}m",
+        fill=(205, 210, 220),
+        font=small_font,
+    )
+
+    def draw_curve(
+        values: np.ndarray,
+        bounds: tuple[float, float, float, float],
+        color: tuple[int, int, int],
+        label: str,
+    ) -> None:
+        plot_left, plot_top, plot_right, plot_bottom = bounds
+        maximum = max(float(values.max()), 1e-3)
+        draw.rectangle(bounds, outline=(65, 72, 84), width=1)
+        points = []
+        for index, value in enumerate(values):
+            x = plot_left + index / max(len(values) - 1, 1) * (plot_right - plot_left)
+            y = plot_bottom - float(value) / maximum * (plot_bottom - plot_top)
+            points.append((x, y))
+        if len(points) > 1:
+            draw.line(points, fill=color, width=2)
+        draw.text(
+            (plot_left + 4, plot_top + 3),
+            f"{label} | max={maximum:.3f}",
+            fill=color,
+            font=small_font,
+        )
+
+    draw_curve(
+        position_error,
+        (left + 18, top + 61, right - 18, top + 205),
+        (255, 120, 80),
+        "position error (m)",
+    )
+    draw_curve(
+        increment_error,
+        (left + 18, top + 222, right - 18, bottom - 22),
+        (80, 210, 160),
+        "body increment error (m)",
+    )
+    draw.text(
+        (right - 105, bottom - 17),
+        f"t={times_np[-1]:.2f}s",
+        fill=(150, 157, 170),
+        font=small_font,
+    )
     array = np.asarray(canvas, dtype=np.float32) / 255.0
     return torch.from_numpy(array).permute(2, 0, 1).contiguous()

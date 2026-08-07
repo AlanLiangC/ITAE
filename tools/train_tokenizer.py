@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train the visual action tokenizer with online or cached PE features."""
+"""Train the VGGT-Omega visual action tokenizer from online or cached features."""
 
 from __future__ import annotations
 
@@ -16,7 +16,11 @@ from vision_action_tokenizer.config import (
     resolve_resume_checkpoint,
     seed_everything,
 )
-from vision_action_tokenizer.data.dataset import CachedPEFeatureDataset, NuScenesWindowDataset
+from vision_action_tokenizer.data.dataset import (
+    CachedVGGTOmegaFeatureDataset,
+    NuScenesWindowDataset,
+    VGGTOmegaResize,
+)
 from vision_action_tokenizer.data.manifest import manifest_scene_tokens
 from vision_action_tokenizer.distributed import cleanup_distributed, initialize_distributed
 from vision_action_tokenizer.losses import LossConfig, TokenizerLoss
@@ -49,26 +53,29 @@ def cache_for_split(config: dict, split: str):
 
 def make_dataset(manifest: Path, config: dict, split: str, overfit_samples: int | None = None):
     cache = cache_for_split(config, split)
-    include_eval_images = bool(
-        config.get("tensorboard", {}).get("evaluation_visualization_include_images", True)
-    )
     base = NuScenesWindowDataset(
         manifest,
-        image_size=int(config["data"]["image_size"]),
-        load_images=cache is None or (split == "val" and include_eval_images),
+        transform=VGGTOmegaResize(
+            image_resolution=int(config["vision_backbone"]["image_resolution"]),
+            mode=str(config["vision_backbone"]["resize_mode"]),
+            patch_size=int(config["vision_backbone"]["patch_size"]),
+        ),
+        load_images=cache is None,
     )
     dataset = (
         base
         if cache is None
-        else CachedPEFeatureDataset(
+        else CachedVGGTOmegaFeatureDataset(
             base,
             cache,
             manifest_path=manifest,
             expected_metadata={
-                "model_name": config["pe"]["model_name"],
-                "checkpoint_path": config["pe"].get("checkpoint_path"),
-                "layer_idx": config["pe"].get("layer_idx"),
-                "pool_size": config["pe"]["pool_size"],
+                "checkpoint_sha256": config["vision_backbone"].get(
+                    "checkpoint_sha256"
+                ),
+                "image_resolution": int(config["vision_backbone"]["image_resolution"]),
+                "resize_mode": str(config["vision_backbone"]["resize_mode"]),
+                "token_mode": str(config["vision_backbone"]["cache_token_mode"]),
             },
         )
     )
@@ -139,8 +146,10 @@ def main() -> None:
     train_cached = cache_for_split(config, "train") is not None
     val_cached = cache_for_split(config, "val") is not None
     if train_cached != val_cached:
-        raise ValueError("Train and val must both use online PE or both use feature caches")
+        raise ValueError("Train and val must both use online VGGT-Omega or feature caches")
     cached = train_cached
+    if not cached and int(config["train"]["batch_size"]) != 1:
+        raise ValueError("Online VGGT-Omega training requires train.batch_size=1 on this GPU")
     model = build_training_model(config, cached=cached).to(context.device)
     if context.world_size > 1:
         model = DistributedDataParallel(
@@ -168,7 +177,12 @@ def main() -> None:
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, schedule)
     trainer = TokenizerTrainer(
         model,
-        TokenizerLoss(LossConfig(**config["loss"])).to(context.device),
+        TokenizerLoss(
+            LossConfig(
+                **config["loss"],
+                steps_per_token=int(config["action_tokenizer"]["steps_per_token"]),
+            )
+        ).to(context.device),
         optimizer,
         scheduler,
         context,

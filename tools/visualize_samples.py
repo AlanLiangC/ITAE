@@ -25,12 +25,13 @@ def main() -> None:
     if len(windows) == 1:
         axes = axes[None, :]
     for row, window in enumerate(windows):
-        for column, (path, time_s) in enumerate(zip(window.image_paths, window.frame_times_s)):
+        pairs = zip(window.image_paths, window.frame_times_s, strict=True)
+        for column, (path, time_s) in enumerate(pairs):
             with Image.open(path) as image:
                 axes[row, column].imshow(image)
             axes[row, column].set_title(f"t={time_s:.1f}s")
             axes[row, column].axis("off")
-        xy = list(zip(*[(point[0], point[1]) for point in window.trajectory]))
+        xy = list(zip(*[(point[0], point[1]) for point in window.trajectory], strict=True))
         axes[row, 6].plot(xy[1], xy[0])
         axes[row, 6].scatter([0], [0], marker="x")
         axes[row, 6].set_xlabel("y left [m]")

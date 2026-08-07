@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vision-action-tokenizer"
-version = "0.1.0"
+version = "0.2.0"
 description = "Vision-aligned continuous action tokenizer for end-to-end driving"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
   "ijson>=3.2",
   "numpy>=1.23",
@@ -15,7 +15,7 @@ dependencies = [
   "PyYAML>=6.0",
   "safetensors>=0.4",
   "tensorboard>=2.14",
-  "torch>=2.1",
+  "torch>=2.3",
 ]
 
 [project.optional-dependencies]
@@ -31,7 +31,8 @@ addopts = "-q"
 
 [tool.ruff]
 line-length = 100
-target-version = "py39"
+target-version = "py310"
+exclude = ["third_party"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

@@ -6,6 +6,7 @@ import torch
 from vision_action_tokenizer.visualization import (
     render_bev_trajectory_comparison,
     render_evaluation_diagnostic,
+    render_vggt_evaluation_diagnostic,
     trajectory_time_color,
 )
 
@@ -49,3 +50,21 @@ def test_evaluation_diagnostic_combines_camera_and_three_bev_panels() -> None:
     assert image.dtype == torch.float32
     assert torch.isfinite(image).all()
     assert 0 <= float(image.min()) <= float(image.max()) <= 1
+
+
+def test_vggt_diagnostic_has_error_panel() -> None:
+    times = torch.arange(1, 41, dtype=torch.float32) / 10
+    target = torch.stack([2 * times, torch.sin(times), 0.1 * times], dim=-1)
+    reconstruction = target + torch.tensor([0.4, -0.2, 0.02])
+    increments = torch.zeros(40, 3)
+    camera_images = torch.rand(5, 3, 32, 48)
+    image = render_vggt_evaluation_diagnostic(
+        target,
+        reconstruction,
+        increments,
+        times,
+        camera_images,
+        torch.arange(5, dtype=torch.float32),
+    )
+    assert image.shape == (3, 900, 1200)
+    assert torch.isfinite(image).all()

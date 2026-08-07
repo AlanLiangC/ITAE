@@ -2,61 +2,98 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "ITAE: Debug LiDAR trajectory manifest (val)",
+            "name": "ITAE VGGT: Audit camera motion",
             "type": "debugpy",
             "request": "launch",
-            "python": "/home/alan/miniconda3/envs/openmmlab/bin/python",
-            "program": "${workspaceFolder}/tools/build_manifest.py",
+            "python": "/home/alan/miniconda3/envs/py312torch210cu126/bin/python",
+            "program": "${workspaceFolder}/tools/inspect_vggt_camera_motion.py",
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
             "justMyCode": false,
             "args": [
-                "--config",
-                "${workspaceFolder}/configs/nuscenes_lidar10hz_front_4s.yaml",
-                "--info",
-                "${workspaceFolder}/data/nuscenes/nuscenes_interp_12Hz_infos_val.pkl",
-                "--output",
-                "/tmp/itae_debug_lidar10hz_val.jsonl",
-                "--report",
-                "/tmp/itae_debug_lidar10hz_val.report.json"
+                "--config", "${workspaceFolder}/configs/nuscenes_vggt_omega_front_4s.yaml",
+                "--manifest", "${workspaceFolder}/data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl",
+                "--output-dir", "${workspaceFolder}/output/vggt_camera_motion_audit/train"
+            ],
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+            }
+        },
+        {
+            "name": "ITAE VGGT: Cache val features",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/alan/miniconda3/envs/py312torch210cu126/bin/python",
+            "program": "${workspaceFolder}/tools/cache_vggt_omega_features.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "--config", "${workspaceFolder}/configs/nuscenes_vggt_omega_front_4s.yaml",
+                "--manifest", "${workspaceFolder}/data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl",
+                "--output", "${workspaceFolder}/data/vggt_omega_cache/nuscenes_front_4s_val",
+                "--shard-size", "128",
+                "--num-workers", "2"
+            ],
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+            }
+        },
+        {
+            "name": "ITAE VGGT: Train tokenizer",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/alan/miniconda3/envs/py312torch210cu126/bin/python",
+            "program": "${workspaceFolder}/tools/train_tokenizer.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": [
+                "--config", "${workspaceFolder}/configs/nuscenes_vggt_omega_front_4s.yaml",
+                "--train-manifest", "${workspaceFolder}/data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl",
+                "--val-manifest", "${workspaceFolder}/data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl",
+                "--output", "${workspaceFolder}/output/itae_vggt_omega_v1"
+            ],
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+            }
+        },
+        {
+            "name": "ITAE VGGT: Evaluate tokenizer",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/alan/miniconda3/envs/py312torch210cu126/bin/python",
+            "program": "${workspaceFolder}/tools/evaluate_tokenizer.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": [
+                "--config", "${workspaceFolder}/configs/nuscenes_vggt_omega_front_4s.yaml",
+                "--manifest", "${workspaceFolder}/data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl",
+                "--train-manifest", "${workspaceFolder}/data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl",
+                "--pose-calibration", "${workspaceFolder}/output/vggt_camera_motion_audit/train/camera_motion_calibration.json",
+                "--checkpoint", "${workspaceFolder}/output/itae_vggt_omega_v1/best.pt",
+                "--output", "${workspaceFolder}/output/itae_vggt_omega_v1/val_metrics.json"
             ],
             "env": {
                 "PYTHONUNBUFFERED": "1"
             }
         },
         {
-            "name": "ITAE: Debug tokenizer training",
+            "name": "Python Debugger: Current File (py312torch210cu126)",
             "type": "debugpy",
             "request": "launch",
-            "python": "/home/alan/miniconda3/envs/openmmlab/bin/python",
-            "program": "${workspaceFolder}/tools/train_tokenizer.py",
-            "cwd": "${workspaceFolder}",
-            "console": "integratedTerminal",
-            "justMyCode": true,
-            "args": [
-                "--config",
-                "${workspaceFolder}/configs/nuscenes_lidar10hz_front_4s.yaml",
-                "--train-manifest",
-                "${workspaceFolder}/data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl",
-                "--val-manifest",
-                "${workspaceFolder}/data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl",
-                "--output",
-                "./output/itae_v2_tokenizer"
-            ],
-            "env": {
-                "PYTHONUNBUFFERED": "1",
-                "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:128"
-            }
-        },
-        {
-            "name": "Python Debugger: Current File",
-            "type": "debugpy",
-            "request": "launch",
-            "python": "/home/alan/miniconda3/envs/openmmlab/bin/python",
+            "python": "/home/alan/miniconda3/envs/py312torch210cu126/bin/python",
             "program": "${file}",
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
-            "justMyCode": false
+            "justMyCode": false,
+            "env": {
+                "PYTHONUNBUFFERED": "1"
+            }
         }
     ]
 }

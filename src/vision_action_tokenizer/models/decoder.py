@@ -6,106 +6,110 @@ import torch
 import torch.nn.functional as functional
 from torch import Tensor, nn
 
-from .common import MLP, sinusoidal_time_embedding
+from .common import MLP
 
 
-class TrajectoryDecoder(nn.Module):
-    """Decode action tokens to a local `[x,y,yaw]` trajectory without visual context.
+def trajectory_to_body_increments(trajectory: Tensor) -> Tensor:
+    """Convert anchor-frame `[x,y,yaw]` poses into body-frame SE(2) increments."""
+    if trajectory.ndim != 3 or trajectory.shape[-1] != 3:
+        raise ValueError(f"Expected trajectory [B,T,3], got {tuple(trajectory.shape)}")
+    origin = torch.zeros_like(trajectory[:, :1])
+    previous = torch.cat([origin, trajectory[:, :-1]], dim=1)
+    global_delta = trajectory[..., :2] - previous[..., :2]
+    previous_yaw = previous[..., 2]
+    cosine = torch.cos(previous_yaw)
+    sine = torch.sin(previous_yaw)
+    body_dx = cosine * global_delta[..., 0] + sine * global_delta[..., 1]
+    body_dy = -sine * global_delta[..., 0] + cosine * global_delta[..., 1]
+    delta_yaw = torch.atan2(
+        torch.sin(trajectory[..., 2] - previous_yaw),
+        torch.cos(trajectory[..., 2] - previous_yaw),
+    )
+    return torch.stack([body_dx, body_dy, delta_yaw], dim=-1)
 
-    `future_times` is only a query grid in seconds. No current/future PE feature or
-    scene condition enters this module, so the action latent must be sufficient.
-    """
+
+def integrate_se2_increments(increments: Tensor) -> Tensor:
+    """Integrate body-frame `[dx,dy,dyaw]` increments into anchor-frame poses."""
+    if increments.ndim != 3 or increments.shape[-1] != 3:
+        raise ValueError(f"Expected increments [B,T,3], got {tuple(increments.shape)}")
+    x = torch.zeros_like(increments[:, 0, 0])
+    y = torch.zeros_like(x)
+    yaw = torch.zeros_like(x)
+    states = []
+    for step in range(increments.shape[1]):
+        dx, dy, delta_yaw = increments[:, step].unbind(dim=-1)
+        cosine = torch.cos(yaw)
+        sine = torch.sin(yaw)
+        x = x + cosine * dx - sine * dy
+        y = y + sine * dx + cosine * dy
+        yaw = torch.atan2(torch.sin(yaw + delta_yaw), torch.cos(yaw + delta_yaw))
+        states.append(torch.stack([x, y, yaw], dim=-1))
+    return torch.stack(states, dim=1)
+
+
+class SE2IncrementDecoder(nn.Module):
+    """Decode each interval action token into fixed-rate body-frame SE(2) increments."""
 
     def __init__(
         self,
-        latent_dim: int,
-        model_dim: int,
-        num_heads: int,
-        num_layers: int,
-        dropout: float,
-        decoder_type: str = "kinematic",
-        max_speed_mps: float = 35.0,
-        max_accel_mps2: float = 8.0,
-        max_yaw_rate_rps: float = 1.5,
+        action_dim: int = 128,
+        hidden_dim: int = 256,
+        steps_per_token: int = 10,
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
-        if decoder_type not in {"direct", "kinematic"}:
-            raise ValueError("decoder_type must be `direct` or `kinematic`")
-        self.decoder_type = decoder_type
-        self.model_dim = model_dim
-        self.max_speed_mps = max_speed_mps
-        self.max_accel_mps2 = max_accel_mps2
-        self.max_yaw_rate_rps = max_yaw_rate_rps
-        self.memory_projection = nn.Sequential(
-            nn.LayerNorm(latent_dim), nn.Linear(latent_dim, model_dim)
+        if steps_per_token <= 0:
+            raise ValueError("steps_per_token must be positive")
+        self.steps_per_token = steps_per_token
+        self.action_projection = nn.Sequential(
+            nn.LayerNorm(action_dim), nn.Linear(action_dim, hidden_dim)
         )
-        self.time_projection = MLP(model_dim, model_dim, model_dim)
-        layer = nn.TransformerDecoderLayer(
-            d_model=model_dim,
-            nhead=num_heads,
-            dim_feedforward=model_dim * 4,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
+        self.step_embedding = nn.Parameter(torch.randn(steps_per_token, hidden_dim) * 0.02)
+        self.time_projection = MLP(2, hidden_dim, hidden_dim, dropout)
+        self.decoder = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 2, 4),
         )
-        self.decoder = nn.TransformerDecoder(layer, num_layers, nn.LayerNorm(model_dim))
-        self.direct_head = nn.Linear(model_dim, 4)
-        self.control_head = nn.Linear(model_dim, 2)
-        self.initial_speed_head = MLP(model_dim, model_dim, 1)
+        output = self.decoder[-1]
+        assert isinstance(output, nn.Linear)
+        nn.init.normal_(output.weight, std=1e-3)
+        nn.init.zeros_(output.bias)
+        with torch.no_grad():
+            output.bias[3] = 1.0
 
-    def forward(self, action_tokens: Tensor, future_times: Tensor) -> Tensor:
+    def forward(self, action_tokens: Tensor, future_times: Tensor) -> tuple[Tensor, Tensor]:
         if action_tokens.ndim != 3 or future_times.ndim != 2:
-            raise ValueError("Expected action_tokens [B,K,Dz] and future_times [B,T]")
-        memory = self.memory_projection(action_tokens)
-        queries = self.time_projection(sinusoidal_time_embedding(future_times, self.model_dim))
-        decoded = self.decoder(queries, memory)
-        if self.decoder_type == "direct":
-            raw = self.direct_head(decoded)
-            sin_cos = functional.normalize(raw[..., 2:4], dim=-1, eps=1e-6)
-            yaw = torch.atan2(sin_cos[..., 0], sin_cos[..., 1])
-            return torch.cat([raw[..., :2], yaw.unsqueeze(-1)], dim=-1)
+            raise ValueError("Expected action_tokens [B,K,D] and future_times [B,T]")
+        batch, intervals, _ = action_tokens.shape
+        expected_steps = intervals * self.steps_per_token
+        if future_times.shape != (batch, expected_steps):
+            raise ValueError(
+                f"Expected {expected_steps} future times for {intervals} action tokens, "
+                f"got {tuple(future_times.shape)}"
+            )
+        zero = torch.zeros_like(future_times[:, :1])
+        delta_t = torch.diff(torch.cat([zero, future_times], dim=1), dim=1)
+        if torch.any(delta_t <= 0):
+            raise ValueError("future_times must be strictly increasing and positive")
+        delta_t = delta_t.reshape(batch, intervals, self.steps_per_token)
+        fraction = torch.arange(
+            1,
+            self.steps_per_token + 1,
+            dtype=future_times.dtype,
+            device=future_times.device,
+        ) / self.steps_per_token
+        fraction = fraction.view(1, 1, self.steps_per_token).expand(batch, intervals, -1)
+        time_features = torch.stack([delta_t, fraction], dim=-1)
 
-        controls = self.control_head(decoded)
-        acceleration = torch.tanh(controls[..., 0]) * self.max_accel_mps2
-        yaw_rate = torch.tanh(controls[..., 1]) * self.max_yaw_rate_rps
-        initial_speed = torch.sigmoid(self.initial_speed_head(memory.mean(dim=1)).squeeze(-1))
-        initial_speed = initial_speed * self.max_speed_mps
-        return integrate_unicycle(initial_speed, acceleration, yaw_rate, future_times)
-
-
-def integrate_unicycle(
-    initial_speed: Tensor, acceleration: Tensor, yaw_rate: Tensor, future_times: Tensor
-) -> Tensor:
-    """Integrate controls to `[x,y,yaw]` using a midpoint unicycle scheme.
-
-    Args:
-        initial_speed: `[B]` in m/s, predicted from action tokens.
-        acceleration: `[B,T]` in m/s^2.
-        yaw_rate: `[B,T]` in rad/s.
-        future_times: Strictly increasing `[B,T]` seconds after the anchor.
-    """
-    if not (acceleration.shape == yaw_rate.shape == future_times.shape):
-        raise ValueError("acceleration, yaw_rate and future_times must share [B,T] shape")
-    zeros = torch.zeros_like(future_times[:, :1])
-    delta_t = torch.diff(torch.cat([zeros, future_times], dim=1), dim=1)
-    if torch.any(delta_t <= 0):
-        raise ValueError("future_times must be strictly increasing and positive")
-
-    x = torch.zeros_like(initial_speed)
-    y = torch.zeros_like(initial_speed)
-    yaw = torch.zeros_like(initial_speed)
-    speed = initial_speed
-    states = []
-    for step in range(future_times.shape[1]):
-        dt = delta_t[:, step]
-        next_speed = (speed + acceleration[:, step] * dt).clamp_min(0.0)
-        next_yaw = yaw + yaw_rate[:, step] * dt
-        mid_speed = 0.5 * (speed + next_speed)
-        mid_yaw = 0.5 * (yaw + next_yaw)
-        x = x + mid_speed * torch.cos(mid_yaw) * dt
-        y = y + mid_speed * torch.sin(mid_yaw) * dt
-        yaw = next_yaw
-        speed = next_speed
-        states.append(torch.stack([x, y, yaw], dim=-1))
-    return torch.stack(states, dim=1)
+        hidden = self.action_projection(action_tokens).unsqueeze(2)
+        hidden = hidden + self.step_embedding.view(1, 1, self.steps_per_token, -1)
+        hidden = hidden + self.time_projection(time_features)
+        raw = self.decoder(hidden)
+        sin_cos = functional.normalize(raw[..., 2:4], dim=-1, eps=1e-6)
+        delta_yaw = torch.atan2(sin_cos[..., 0], sin_cos[..., 1])
+        increments = torch.cat([raw[..., :2], delta_yaw.unsqueeze(-1)], dim=-1)
+        increments = increments.reshape(batch, expected_steps, 3)
+        return integrate_se2_increments(increments), increments

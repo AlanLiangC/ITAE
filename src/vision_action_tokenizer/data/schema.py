@@ -283,7 +283,7 @@ def inspect_records(
         ordered = sorted(scene_records, key=lambda item: item.cam_front_timestamp_us)
         intervals_ms.extend(
             (b.cam_front_timestamp_us - a.cam_front_timestamp_us) / 1000.0
-            for a, b in zip(ordered, ordered[1:])
+            for a, b in zip(ordered, ordered[1:], strict=False)
         )
         pose_controls = sorted(
             (record for record in scene_records if not record.pose_interpolated),
@@ -291,7 +291,7 @@ def inspect_records(
         )
         pose_control_intervals_ms.extend(
             (right.timestamp_us - left.timestamp_us) / 1000.0
-            for left, right in zip(pose_controls, pose_controls[1:])
+            for left, right in zip(pose_controls, pose_controls[1:], strict=False)
         )
     intervals = np.asarray(intervals_ms, dtype=np.float64)
     pose_intervals = np.asarray(pose_control_intervals_ms, dtype=np.float64)
