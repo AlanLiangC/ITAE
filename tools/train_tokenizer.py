@@ -5,11 +5,12 @@ from __future__ import annotations
 
 import argparse
 import math
+from collections import Counter
 from pathlib import Path
 
 import torch
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader, DistributedSampler, Subset
+from torch.utils.data import DataLoader, DistributedSampler, Subset, WeightedRandomSampler
 
 from vision_action_tokenizer.config import (
     load_config,
@@ -21,7 +22,7 @@ from vision_action_tokenizer.data.dataset import (
     NuScenesWindowDataset,
     VGGTOmegaResize,
 )
-from vision_action_tokenizer.data.manifest import manifest_scene_tokens
+from vision_action_tokenizer.data.manifest import WindowRecord, load_manifest, manifest_scene_tokens
 from vision_action_tokenizer.distributed import cleanup_distributed, initialize_distributed
 from vision_action_tokenizer.losses import LossConfig, TokenizerLoss
 from vision_action_tokenizer.models.factory import build_training_model
@@ -84,6 +85,77 @@ def make_dataset(manifest: Path, config: dict, split: str, overfit_samples: int 
     return dataset
 
 
+def motion_bucket(window: WindowRecord) -> str:
+    """Use the same coarse motion groups reported by the evaluator."""
+    endpoint = torch.as_tensor(window.trajectory[-1])
+    distance = float(torch.linalg.vector_norm(endpoint[:2]))
+    lateral = abs(float(endpoint[1]))
+    yaw = abs(float(endpoint[2]))
+    if distance < 2.0:
+        return "stationary"
+    if lateral > 2.0 or yaw > 0.15:
+        return "turn"
+    return "straight_slow" if distance < 20.0 else "straight_fast"
+
+
+def make_motion_sampler(
+    manifest: Path,
+    config: dict,
+    dataset_size: int,
+    overfit_samples: int | None,
+    world_size: int,
+) -> WeightedRandomSampler | None:
+    balancing = config["train"].get("motion_balancing", {})
+    if not bool(balancing.get("enabled", False)):
+        return None
+    if world_size > 1:
+        raise ValueError(
+            "train.motion_balancing currently supports one process; disable it for DDP"
+        )
+    configured = balancing.get("bucket_weights", {})
+    bucket_names = {"stationary", "straight_slow", "straight_fast", "turn"}
+    if set(configured) != bucket_names:
+        raise ValueError(
+            "train.motion_balancing.bucket_weights must define exactly "
+            f"{sorted(bucket_names)}"
+        )
+    bucket_weights = {name: float(value) for name, value in configured.items()}
+    if any(value <= 0 for value in bucket_weights.values()):
+        raise ValueError("Motion bucket weights must all be positive")
+
+    windows = load_manifest(manifest)
+    if overfit_samples is not None:
+        windows = windows[:overfit_samples]
+    if len(windows) != dataset_size:
+        raise ValueError(
+            f"Sampler manifest/dataset mismatch: {len(windows)} != {dataset_size}"
+        )
+    buckets = [motion_bucket(window) for window in windows]
+    sample_weights = torch.tensor(
+        [bucket_weights[bucket] for bucket in buckets], dtype=torch.double
+    )
+    generator = torch.Generator().manual_seed(int(config["seed"]))
+    counts = Counter(buckets)
+    weighted_counts = {
+        name: counts[name] * bucket_weights[name] for name in sorted(bucket_names)
+    }
+    normalization = sum(weighted_counts.values())
+    expected = {
+        name: weighted_counts[name] / normalization for name in sorted(bucket_names)
+    }
+    print(
+        f"Motion-balanced sampling counts={dict(counts)} "
+        f"expected_fractions={expected}",
+        flush=True,
+    )
+    return WeightedRandomSampler(
+        sample_weights,
+        num_samples=dataset_size,
+        replacement=True,
+        generator=generator,
+    )
+
+
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
@@ -121,9 +193,15 @@ def main() -> None:
         )
     train_dataset = make_dataset(args.train_manifest, config, "train", args.overfit_samples)
     val_dataset = make_dataset(args.val_manifest, config, "val", args.overfit_samples)
-    train_sampler = (
-        DistributedSampler(train_dataset, shuffle=True) if context.world_size > 1 else None
+    train_sampler = make_motion_sampler(
+        args.train_manifest,
+        config,
+        len(train_dataset),
+        args.overfit_samples,
+        context.world_size,
     )
+    if train_sampler is None and context.world_size > 1:
+        train_sampler = DistributedSampler(train_dataset, shuffle=True)
     val_sampler = DistributedSampler(val_dataset, shuffle=False) if context.world_size > 1 else None
     train_loader = DataLoader(
         train_dataset,

@@ -81,15 +81,22 @@ def main() -> None:
             if extractor is None:
                 camera = batch["camera_hidden"].to(device).float()
                 registers = batch["register_hidden_mean"].to(device).float()
+                register_hidden = (
+                    batch["register_hidden"].to(device).float()
+                    if "register_hidden" in batch
+                    else None
+                )
             else:
                 features = extractor(batch["images"].to(device))
                 camera = features.camera_hidden
                 registers = features.register_hidden_mean
+                register_hidden = features.register_hidden
             output = tokenizer(
                 camera,
                 registers,
                 batch["frame_times"].to(device),
                 batch["future_times"].to(device),
+                register_hidden=register_hidden,
             )
             latents.append(output.action_tokens.float().cpu())
             sample_tokens.extend(batch["sample_token"])

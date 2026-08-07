@@ -24,6 +24,7 @@ class OmegaCameraFeatures:
     """Geometry-focused outputs after the pretrained CameraHead trunk."""
 
     camera_hidden: Tensor
+    register_hidden: Tensor
     register_hidden_mean: Tensor
     pose_enc: Tensor
 
@@ -111,13 +112,15 @@ class OmegaCameraFeatureExtractor(nn.Module):
             hidden = special.reshape(batch, frames, special_count, dim)
             hidden = head.trunk_norm(hidden)
             camera_hidden = hidden[:, :, 0]
-            register_hidden_mean = hidden[:, :, 1:].mean(dim=2)
+            register_hidden = hidden[:, :, 1:]
+            register_hidden_mean = register_hidden.mean(dim=2)
             raw_pose = head.camera_branch(camera_hidden)
             pose_enc = torch.cat(
                 [raw_pose[..., :7], torch.relu(raw_pose[..., 7:]) + 0.01], dim=-1
             )
         return OmegaCameraFeatures(
             camera_hidden=camera_hidden,
+            register_hidden=register_hidden,
             register_hidden_mean=register_hidden_mean,
             pose_enc=pose_enc,
         )
@@ -144,6 +147,7 @@ class OnlineOmegaTrainingModel(nn.Module):
         return self.tokenizer(
             camera_hidden=features.camera_hidden,
             register_hidden_mean=features.register_hidden_mean,
+            register_hidden=features.register_hidden,
             frame_times=frame_times,
             future_times=future_times,
         )
@@ -162,11 +166,13 @@ class CachedOmegaTrainingModel(nn.Module):
         register_hidden_mean: Tensor,
         frame_times: Tensor,
         future_times: Tensor,
+        register_hidden: Tensor | None = None,
         **_: Any,
     ) -> Any:
         return self.tokenizer(
             camera_hidden=camera_hidden,
             register_hidden_mean=register_hidden_mean,
+            register_hidden=register_hidden,
             frame_times=frame_times,
             future_times=future_times,
         )

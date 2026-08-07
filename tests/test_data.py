@@ -100,6 +100,51 @@ def test_vggt_cache_rejects_incomplete_and_corrupt_shards(tmp_path: Path) -> Non
         dataset[0]
 
 
+def test_vggt_rich_register_cache_returns_all_tokens(tmp_path: Path) -> None:
+    record = WindowRecord(
+        sample_token="sample",
+        scene_token="scene",
+        anchor_timestamp_us=0,
+        image_paths=[],
+        image_timestamps_us=[],
+        frame_times_s=[0, 1, 2, 3, 4],
+        trajectory=[[0.0, 0.0, 0.0]] * 40,
+        future_times_s=[step / 10 for step in range(1, 41)],
+        max_image_time_error_us=0,
+        max_trajectory_time_error_us=0,
+    )
+    base = NuScenesWindowDataset([record], load_images=False)
+    tensors = {
+        "camera_hidden": torch.zeros(1, 5, 8),
+        "register_hidden_mean": torch.zeros(1, 5, 8),
+        "register_hidden": torch.zeros(1, 5, 16, 8),
+        "pose_enc": torch.zeros(1, 5, 9),
+    }
+    shard = tmp_path / "features_00000.safetensors"
+    save_file(tensors, shard)
+    index = {
+        "cache_type": "vggt_omega_camera_head_hidden_v1",
+        "token_mode": "camera_register_tokens",
+        "num_samples": 1,
+        "complete": True,
+        "camera_hidden_shape": [5, 8],
+        "register_hidden_mean_shape": [5, 8],
+        "register_hidden_shape": [5, 16, 8],
+        "pose_enc_shape": [5, 9],
+        "shards": [
+            {
+                "file": shard.name,
+                "start": 0,
+                "end": 1,
+                "sha256": hashlib.sha256(shard.read_bytes()).hexdigest(),
+            }
+        ],
+    }
+    (tmp_path / "index.json").write_text(json.dumps(index), encoding="utf-8")
+    sample = CachedVGGTOmegaFeatureDataset(base, tmp_path)[0]
+    assert sample["register_hidden"].shape == (5, 16, 8)
+
+
 def test_pose_interpolation_uses_shortest_rotation() -> None:
     yaw_left = np.deg2rad(170.0)
     yaw_right = np.deg2rad(-170.0)

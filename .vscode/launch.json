@@ -62,6 +62,47 @@
             }
         },
         {
+            "name": "ITAE VGGT V2: Train motion",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/alan/miniconda3/envs/py312torch210cu126/bin/python",
+            "program": "${workspaceFolder}/tools/train_tokenizer.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": [
+                "--config", "${workspaceFolder}/configs/nuscenes_vggt_omega_front_4s_v2_motion.yaml",
+                "--train-manifest", "${workspaceFolder}/data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl",
+                "--val-manifest", "${workspaceFolder}/data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl",
+                "--output", "${workspaceFolder}/output/itae_vggt_omega_v2_motion"
+            ],
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+            }
+        },
+        {
+            "name": "ITAE VGGT V2: Cache rich val",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/alan/miniconda3/envs/py312torch210cu126/bin/python",
+            "program": "${workspaceFolder}/tools/cache_vggt_omega_features.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "--config", "${workspaceFolder}/configs/nuscenes_vggt_omega_front_4s_v2_rich_register.yaml",
+                "--manifest", "${workspaceFolder}/data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl",
+                "--output", "/home/alan/AlanLiang/Dataset/vggt_omega_cache/nuscenes_front_4s_val_rich",
+                "--shard-size", "128",
+                "--num-workers", "2"
+            ],
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+            }
+        },
+        {
             "name": "ITAE VGGT: Evaluate tokenizer",
             "type": "debugpy",
             "request": "launch",

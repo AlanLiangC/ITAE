@@ -120,8 +120,6 @@ class NuScenesWindowDataset(Dataset[Sample]):
 class CachedVGGTOmegaFeatureDataset(Dataset[Sample]):
     """Attach strict cached CameraHead hidden tokens to a trajectory sample."""
 
-    tensor_keys = ("camera_hidden", "register_hidden_mean", "pose_enc")
-
     def __init__(
         self,
         base: NuScenesWindowDataset,
@@ -146,15 +144,23 @@ class CachedVGGTOmegaFeatureDataset(Dataset[Sample]):
             raise ValueError("VGGT-Omega cache is incomplete; resume feature extraction first")
         if int(self.index["num_samples"]) != len(base):
             raise ValueError("VGGT-Omega cache sample count does not match manifest")
+        # Caches created before token_mode was recorded contain this exact mean-only set.
+        token_mode = self.index.get("token_mode", "camera_register_mean")
+        self.tensor_keys = ["camera_hidden", "register_hidden_mean", "pose_enc"]
+        if token_mode == "camera_register_tokens":
+            self.tensor_keys.insert(2, "register_hidden")
+        elif token_mode != "camera_register_mean":
+            raise ValueError(f"Unsupported VGGT-Omega cache token mode: {token_mode!r}")
         if manifest_path is not None:
             digest = hashlib.sha256(Path(manifest_path).read_bytes()).hexdigest()
             if self.index.get("manifest_sha256") != digest:
                 raise ValueError("VGGT-Omega cache was built from a different manifest")
         for key, expected in (expected_metadata or {}).items():
-            if expected is not None and self.index.get(key) != expected:
+            actual = token_mode if key == "token_mode" else self.index.get(key)
+            if expected is not None and actual != expected:
                 raise ValueError(
                     f"VGGT-Omega cache metadata mismatch for {key}: "
-                    f"{self.index.get(key)!r} != {expected!r}"
+                    f"{actual!r} != {expected!r}"
                 )
         self._loaded_file: str | None = None
         self._loaded_tensors: dict[str, Tensor] | None = None

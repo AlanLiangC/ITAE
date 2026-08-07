@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.distributed as dist
 from PIL import Image
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel
@@ -89,6 +90,18 @@ class TokenizerTrainer:
         self.config = config or {}
         self.global_step = 0
         self.best_ade = math.inf
+        train_config = self.config.get("train", {})
+        self.early_stopping_patience = int(
+            train_config.get("early_stopping_patience", 0)
+        )
+        self.early_stopping_min_delta = float(
+            train_config.get("early_stopping_min_delta", 0.0)
+        )
+        self.epochs_without_improvement = 0
+        if self.early_stopping_patience < 0:
+            raise ValueError("train.early_stopping_patience must be non-negative")
+        if self.early_stopping_min_delta < 0:
+            raise ValueError("train.early_stopping_min_delta must be non-negative")
         self.scaler = torch.amp.GradScaler(
             "cuda", enabled=precision == "fp16" and context.device.type == "cuda"
         )
@@ -144,18 +157,41 @@ class TokenizerTrainer:
                     sampler.set_epoch(epoch)
                 self._train_epoch(train_loader, epoch, log_every)
                 metrics = self.evaluate(val_loader, epoch=epoch)
+                ade = float(metrics.get("metric/ade_m", torch.tensor(math.inf)))
+                is_best = ade < self.best_ade - self.early_stopping_min_delta
+                if is_best:
+                    self.best_ade = ade
+                    self.epochs_without_improvement = 0
+                else:
+                    self.epochs_without_improvement += 1
                 if self.context.is_main:
                     self._print_metrics(f"val epoch={epoch}", metrics)
                     self._write_scalars("validation", metrics, self.global_step)
                     if self.writer is not None:
                         self.writer.add_scalar("progress/epoch", epoch, self.global_step)
-                    ade = metrics.get("metric/ade_m", torch.tensor(math.inf)).item()
-                    is_best = ade < self.best_ade
-                    if is_best:
-                        self.best_ade = ade
                     self.save_checkpoint("last.pt", epoch)
                     if is_best:
                         self.save_checkpoint("best.pt", epoch)
+                should_stop = (
+                    self.early_stopping_patience > 0
+                    and self.epochs_without_improvement >= self.early_stopping_patience
+                )
+                if self.context.world_size > 1:
+                    stop_tensor = torch.tensor(
+                        int(should_stop), device=self.context.device, dtype=torch.int32
+                    )
+                    dist.broadcast(stop_tensor, src=0)
+                    should_stop = bool(stop_tensor.item())
+                if should_stop:
+                    if self.context.is_main:
+                        print(
+                            "Early stopping: validation ADE did not improve by "
+                            f"{self.early_stopping_min_delta:g} m for "
+                            f"{self.epochs_without_improvement} epochs; "
+                            f"best={self.best_ade:.5f} m",
+                            flush=True,
+                        )
+                    break
         finally:
             if self.writer is not None:
                 self.writer.flush()
@@ -180,6 +216,8 @@ class TokenizerTrainer:
                 if "camera_hidden" in batch:
                     model_inputs["camera_hidden"] = batch["camera_hidden"]
                     model_inputs["register_hidden_mean"] = batch["register_hidden_mean"]
+                    if "register_hidden" in batch:
+                        model_inputs["register_hidden"] = batch["register_hidden"]
                 else:
                     model_inputs["images"] = batch["images"]
                 output = self.model(**model_inputs)
@@ -238,6 +276,8 @@ class TokenizerTrainer:
                 if "camera_hidden" in batch:
                     model_inputs["camera_hidden"] = batch["camera_hidden"]
                     model_inputs["register_hidden_mean"] = batch["register_hidden_mean"]
+                    if "register_hidden" in batch:
+                        model_inputs["register_hidden"] = batch["register_hidden"]
                 else:
                     model_inputs["images"] = batch["images"]
                 output = self.model(**model_inputs)
@@ -317,6 +357,7 @@ class TokenizerTrainer:
             "epoch": epoch,
             "global_step": self.global_step,
             "best_ade": self.best_ade,
+            "epochs_without_improvement": self.epochs_without_improvement,
             "config": self.config,
             "torch_rng_state": torch.get_rng_state(),
             "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
@@ -348,6 +389,9 @@ class TokenizerTrainer:
         self.scaler.load_state_dict(checkpoint["scaler"])
         self.global_step = int(checkpoint["global_step"])
         self.best_ade = float(checkpoint["best_ade"])
+        self.epochs_without_improvement = int(
+            checkpoint.get("epochs_without_improvement", 0)
+        )
         torch.set_rng_state(checkpoint["torch_rng_state"].cpu())
         if torch.cuda.is_available() and checkpoint["cuda_rng_state"] is not None:
             torch.cuda.set_rng_state_all([state.cpu() for state in checkpoint["cuda_rng_state"]])

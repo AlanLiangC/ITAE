@@ -49,7 +49,7 @@ Policy。使用、发布 checkpoint 或衍生权重前，请确认当前自动�
 - 图像与 LiDAR 时间误差、插值上限、采样策略；
 - VGGT resize、checkpoint 与 cache 路径；
 - action token 数量/维度、每个 token 的轨迹步数、decoder 维度；
-- 四项 loss 权重、训练和 TensorBoard 设置。
+- 轨迹、运动学平滑 loss 权重、运动分桶采样、早停和 TensorBoard 设置。
 
 已有 manifest：
 
@@ -145,6 +145,31 @@ tensorboard --logdir output/itae_vggt_omega_v1/tensorboard --port 6006
 std/cosine。evaluation 按配置抽样生成 1200×900 的 2×2 页面：五张主视图、GT BEV、重建
 BEV，以及逐时刻 position/body-increment error。即便训练读取 cache，val dataset 仍会为这些
 页面读取原始图像。
+
+### V2 收敛优化与消融配置
+
+V1 在 epoch 161 达到最佳 val ADE `0.343 m`，随后训练到 500 epoch 只表现为轻微过拟合；
+因此 V2 优先改善运动参数化和长尾采样，而不是只增大 MLP：
+
+- `nuscenes_vggt_omega_front_4s_v2_motion.yaml`：推荐先跑，复用现有 mean cache；
+- `nuscenes_vggt_omega_front_4s_v2_motion_large.yaml`：只扩大 adapter/decoder，用于判断容量收益；
+- `nuscenes_vggt_omega_front_4s_v2_rich_register.yaml`：保留 16 个 register token 并 attention pool，
+  用于判断 cache 压缩是否损失信息。
+
+推荐基线命令：
+
+```bash
+torchrun --standalone --nproc_per_node=1 \
+  tools/train_tokenizer.py \
+  --config configs/nuscenes_vggt_omega_front_4s_v2_motion.yaml \
+  --train-manifest data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
+  --val-manifest data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl \
+  --output output/itae_vggt_omega_v2_motion
+```
+
+不同结构必须使用不同 output；不要让 `resume: auto` 把 V1 权重载入 V2。完整实验顺序、rich
+cache 命令和比较指标见
+[`docs/VGGT_OMEGA_V2_EXPERIMENTS.md`](docs/VGGT_OMEGA_V2_EXPERIMENTS.md)。
 
 ## 4. 评估与 action latent 导出
 

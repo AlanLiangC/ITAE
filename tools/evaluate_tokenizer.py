@@ -197,11 +197,17 @@ def main() -> None:
                 if extractor is None:
                     camera_hidden = batch["camera_hidden"].to(device).float()
                     registers = batch["register_hidden_mean"].to(device).float()
+                    register_hidden = (
+                        batch["register_hidden"].to(device).float()
+                        if "register_hidden" in batch
+                        else None
+                    )
                     pose_enc = batch["pose_enc"].to(device).float()
                 else:
                     features = extractor(batch["images"].to(device))
                     camera_hidden = features.camera_hidden
                     registers = features.register_hidden_mean
+                    register_hidden = features.register_hidden
                     pose_enc = features.pose_enc
                 trajectory = batch["trajectory"].to(device)
                 times = batch["future_times"].to(device)
@@ -211,6 +217,7 @@ def main() -> None:
                     registers,
                     batch["frame_times"].to(device),
                     times,
+                    register_hidden=register_hidden,
                 )
                 pose_prediction = (
                     None

@@ -58,6 +58,68 @@ def test_se2_decoder_shape_and_finite_output() -> None:
     assert torch.isfinite(trajectory).all()
 
 
+def test_velocity_decoder_uses_measured_lidar_timestep() -> None:
+    decoder = SE2IncrementDecoder(
+        action_dim=16,
+        hidden_dim=32,
+        steps_per_token=10,
+        parameterization="velocity",
+        initial_forward_speed_mps=5.0,
+    )
+    with torch.no_grad():
+        decoder.decoder[-1].weight.zero_()
+    action = torch.zeros(2, 4, 16)
+    regular = torch.arange(1, 41).float() / 10
+    stretched = torch.arange(1, 41).float() / 8
+    times = torch.stack([regular, stretched])
+    _, increments = decoder(action, times)
+    ratio = increments[1, :, 0] / increments[0, :, 0]
+    assert torch.allclose(ratio, torch.full_like(ratio, 1.25), atol=1e-5)
+
+
+def test_rich_register_attention_tokenizer_backward() -> None:
+    tokenizer = VisionActionTokenizer(
+        vggt_feature_dim=32,
+        frame_geometry_dim=16,
+        action_token_dim=8,
+        num_action_tokens=4,
+        steps_per_token=10,
+        decoder_hidden_dim=32,
+        interval_mixer_layers=1,
+        interval_mixer_heads=2,
+        register_pooling="attention",
+        register_summary_tokens=2,
+        register_pool_dim=8,
+        decoder_parameterization="velocity",
+    )
+    camera = torch.randn(2, 5, 32)
+    register_mean = torch.randn(2, 5, 32)
+    registers = torch.randn(2, 5, 16, 32)
+    frame_times = torch.arange(5).float().repeat(2, 1)
+    future_times = torch.arange(1, 41).float().repeat(2, 1) / 10
+    output = tokenizer(
+        camera,
+        register_mean,
+        frame_times,
+        future_times,
+        register_hidden=registers,
+    )
+    target = torch.zeros_like(output.reconstruction)
+    loss, terms = TokenizerLoss(
+        LossConfig(
+            body_velocity_weight=0.1,
+            yaw_rate_weight=0.02,
+            acceleration_weight=0.002,
+            jerk_weight=0.00002,
+            boundary_continuity_weight=0.01,
+        )
+    )(output, target, future_times)
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert "loss/body_velocity" in terms
+    assert tokenizer.encoder.register_queries.grad is not None
+
+
 def test_full_vggt_tokenizer_loss_backward() -> None:
     tokenizer = VisionActionTokenizer(
         vggt_feature_dim=32,

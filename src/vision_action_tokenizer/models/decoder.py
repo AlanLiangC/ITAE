@@ -48,7 +48,13 @@ def integrate_se2_increments(increments: Tensor) -> Tensor:
 
 
 class SE2IncrementDecoder(nn.Module):
-    """Decode each interval action token into fixed-rate body-frame SE(2) increments."""
+    """Decode interval tokens into body-frame SE(2) increments.
+
+    ``displacement`` preserves the V1 decoder/checkpoint contract. ``velocity`` predicts
+    metric body velocity and yaw rate, then multiplies by the measured step duration;
+    this makes irregular LiDAR timestamps explicit and gives smoothness losses a stable
+    physical unit.
+    """
 
     def __init__(
         self,
@@ -56,11 +62,24 @@ class SE2IncrementDecoder(nn.Module):
         hidden_dim: int = 256,
         steps_per_token: int = 10,
         dropout: float = 0.0,
+        parameterization: str = "displacement",
+        initial_forward_speed_mps: float = 5.0,
+        max_forward_speed_mps: float = 40.0,
+        max_lateral_speed_mps: float = 8.0,
+        max_yaw_rate_rps: float = 1.5,
     ) -> None:
         super().__init__()
         if steps_per_token <= 0:
             raise ValueError("steps_per_token must be positive")
+        if parameterization not in {"displacement", "velocity"}:
+            raise ValueError("parameterization must be `displacement` or `velocity`")
+        if min(max_forward_speed_mps, max_lateral_speed_mps, max_yaw_rate_rps) <= 0:
+            raise ValueError("Velocity and yaw-rate limits must be positive")
         self.steps_per_token = steps_per_token
+        self.parameterization = parameterization
+        self.max_forward_speed_mps = max_forward_speed_mps
+        self.max_lateral_speed_mps = max_lateral_speed_mps
+        self.max_yaw_rate_rps = max_yaw_rate_rps
         self.action_projection = nn.Sequential(
             nn.LayerNorm(action_dim), nn.Linear(action_dim, hidden_dim)
         )
@@ -71,14 +90,17 @@ class SE2IncrementDecoder(nn.Module):
             nn.Linear(hidden_dim, hidden_dim * 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim * 2, 4),
+            nn.Linear(hidden_dim * 2, 4 if parameterization == "displacement" else 3),
         )
         output = self.decoder[-1]
         assert isinstance(output, nn.Linear)
         nn.init.normal_(output.weight, std=1e-3)
         nn.init.zeros_(output.bias)
         with torch.no_grad():
-            output.bias[3] = 1.0
+            if parameterization == "displacement":
+                output.bias[3] = 1.0
+            else:
+                output.bias[0] = initial_forward_speed_mps
 
     def forward(self, action_tokens: Tensor, future_times: Tensor) -> tuple[Tensor, Tensor]:
         if action_tokens.ndim != 3 or future_times.ndim != 2:
@@ -108,8 +130,27 @@ class SE2IncrementDecoder(nn.Module):
         hidden = hidden + self.step_embedding.view(1, 1, self.steps_per_token, -1)
         hidden = hidden + self.time_projection(time_features)
         raw = self.decoder(hidden)
-        sin_cos = functional.normalize(raw[..., 2:4], dim=-1, eps=1e-6)
-        delta_yaw = torch.atan2(sin_cos[..., 0], sin_cos[..., 1])
-        increments = torch.cat([raw[..., :2], delta_yaw.unsqueeze(-1)], dim=-1)
+        if self.parameterization == "displacement":
+            sin_cos = functional.normalize(raw[..., 2:4], dim=-1, eps=1e-6)
+            delta_yaw = torch.atan2(sin_cos[..., 0], sin_cos[..., 1])
+            increments = torch.cat([raw[..., :2], delta_yaw.unsqueeze(-1)], dim=-1)
+        else:
+            forward_velocity = self.max_forward_speed_mps * torch.tanh(
+                raw[..., 0] / self.max_forward_speed_mps
+            )
+            lateral_velocity = self.max_lateral_speed_mps * torch.tanh(
+                raw[..., 1] / self.max_lateral_speed_mps
+            )
+            yaw_rate = self.max_yaw_rate_rps * torch.tanh(
+                raw[..., 2] / self.max_yaw_rate_rps
+            )
+            increments = torch.stack(
+                [
+                    forward_velocity * delta_t,
+                    lateral_velocity * delta_t,
+                    yaw_rate * delta_t,
+                ],
+                dim=-1,
+            )
         increments = increments.reshape(batch, expected_steps, 3)
         return integrate_se2_increments(increments), increments

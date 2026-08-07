@@ -75,6 +75,9 @@ def main() -> None:
 
     config = load_config(args.config)
     backbone = config["vision_backbone"]
+    token_mode = str(backbone["cache_token_mode"])
+    if token_mode not in {"camera_register_mean", "camera_register_tokens"}:
+        raise ValueError("Unsupported vision_backbone.cache_token_mode")
     transform = VGGTOmegaResize(
         image_resolution=int(backbone["image_resolution"]),
         mode=str(backbone["resize_mode"]),
@@ -97,7 +100,7 @@ def main() -> None:
         "image_resolution": int(backbone["image_resolution"]),
         "resize_mode": str(backbone["resize_mode"]),
         "patch_size": int(backbone["patch_size"]),
-        "token_mode": str(backbone["cache_token_mode"]),
+        "token_mode": token_mode,
         "camera_hidden_shape": [
             len(config["data"]["frame_offsets_s"]),
             int(backbone.get("feature_dim", 2048)),
@@ -119,6 +122,12 @@ def main() -> None:
         ),
         "expected_num_samples": sample_count,
     }
+    if token_mode == "camera_register_tokens":
+        metadata["register_hidden_shape"] = [
+            len(config["data"]["frame_offsets_s"]),
+            16,
+            int(backbone.get("feature_dim", 2048)),
+        ]
 
     args.output.mkdir(parents=True, exist_ok=True)
     index_path = args.output / "index.json"
@@ -176,6 +185,8 @@ def main() -> None:
         "register_hidden_mean": [],
         "pose_enc": [],
     }
+    if token_mode == "camera_register_tokens":
+        pending["register_hidden"] = []
     shard_index = len(shards)
     resume_count = count
     started = time.time()
@@ -205,7 +216,7 @@ def main() -> None:
             metadata={
                 "cache_type": "vggt_omega_camera_head_hidden_v1",
                 "checkpoint_sha256": checkpoint_sha,
-                "token_mode": str(backbone["cache_token_mode"]),
+                "token_mode": token_mode,
             },
         )
         os.replace(temporary, destination)
@@ -230,6 +241,8 @@ def main() -> None:
             pending["register_hidden_mean"].append(
                 output.register_hidden_mean.half().cpu()
             )
+            if token_mode == "camera_register_tokens":
+                pending["register_hidden"].append(output.register_hidden.half().cpu())
             pending["pose_enc"].append(output.pose_enc.float().cpu())
             count += output.camera_hidden.shape[0]
             pending_count = sum(value.shape[0] for value in pending["camera_hidden"])

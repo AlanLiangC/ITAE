@@ -1,0 +1,90 @@
+seed: 42
+
+data:
+  data_root: data/nuscenes
+  image_source: keyframe
+  frame_offsets_s: [0.0, 1.0, 2.0, 3.0, 4.0]
+  max_image_time_error_s: 0.25
+  trajectory_pose_source: lidar_sweeps
+  trajectory_sampling: nearest
+  future_horizon_s: 4.0
+  trajectory_hz: 10
+  max_trajectory_time_error_s: 0.03
+  max_pose_interpolation_gap_s: 0.15
+  anchor_stride_s: 0.0
+  feature_cache:
+    train: /home/alan/AlanLiang/Dataset/vggt_omega_cache/nuscenes_front_4s_train
+    val: /home/alan/AlanLiang/Dataset/vggt_omega_cache/nuscenes_front_4s_val
+  num_workers: 4
+
+vision_backbone:
+  type: vggt_omega
+  source_path: third_party/vggt-omega
+  checkpoint_path: /home/alan/AlanLiang/Projects/pure_checkpoints/VGGT-Omega/vggt_omega_1b_512.pt
+  checkpoint_sha256: c02da418b18bb01d0392598d3f6147366bcde1bb70fd08a5e3bf7925b0667934
+  feature_dim: 2048
+  image_resolution: 512
+  resize_mode: max_size
+  patch_size: 16
+  freeze_aggregator: true
+  freeze_camera_trunk: true
+  cache_token_mode: camera_register_mean
+  cache_dtype: float16
+
+action_tokenizer:
+  num_frames: 5
+  num_action_tokens: 4
+  action_token_dim: 128
+  frame_geometry_dim: 256
+  steps_per_token: 10
+  decoder_hidden_dim: 256
+  decoder_type: se2_increment
+  decoder_parameterization: velocity
+  initial_forward_speed_mps: 5.0
+  max_forward_speed_mps: 40.0
+  max_lateral_speed_mps: 8.0
+  max_yaw_rate_rps: 1.5
+  interval_mixer_layers: 2
+  interval_mixer_heads: 4
+  register_pooling: mean
+  dropout: 0.05
+
+loss:
+  trajectory_weight: 1.0
+  increment_weight: 0.25
+  keyframe_weight: 0.75
+  yaw_weight: 0.1
+  body_velocity_weight: 0.1
+  yaw_rate_weight: 0.02
+  acceleration_weight: 0.002
+  jerk_weight: 0.00002
+  boundary_continuity_weight: 0.01
+
+train:
+  resume: auto
+  epochs: 240
+  batch_size: 32
+  learning_rate: 0.0003
+  weight_decay: 0.001
+  warmup_steps: 500
+  grad_clip_norm: 20.0
+  precision: bf16
+  log_every: 20
+  early_stopping_patience: 30
+  early_stopping_min_delta: 0.001
+  motion_balancing:
+    enabled: true
+    bucket_weights:
+      stationary: 0.5
+      straight_slow: 1.0
+      straight_fast: 1.25
+      turn: 1.5
+
+tensorboard:
+  enabled: true
+  log_dir: null
+  flush_secs: 30
+  evaluation_visualization_items: 8
+  evaluation_visualization_every_epochs: 5
+  evaluation_visualization_include_images: true
+  evaluation_visualization_distinct_scenes: true

@@ -44,6 +44,18 @@ def build_tokenizer(config: dict[str, Any]) -> VisionActionTokenizer:
         steps_per_token=int(action["steps_per_token"]),
         decoder_hidden_dim=int(action["decoder_hidden_dim"]),
         dropout=float(action["dropout"]),
+        interval_mixer_layers=int(action.get("interval_mixer_layers", 0)),
+        interval_mixer_heads=int(action.get("interval_mixer_heads", 4)),
+        register_pooling=str(action.get("register_pooling", "mean")),
+        register_summary_tokens=int(action.get("register_summary_tokens", 4)),
+        register_pool_dim=int(action.get("register_pool_dim", 128)),
+        decoder_parameterization=str(
+            action.get("decoder_parameterization", "displacement")
+        ),
+        initial_forward_speed_mps=float(action.get("initial_forward_speed_mps", 5.0)),
+        max_forward_speed_mps=float(action.get("max_forward_speed_mps", 40.0)),
+        max_lateral_speed_mps=float(action.get("max_lateral_speed_mps", 8.0)),
+        max_yaw_rate_rps=float(action.get("max_yaw_rate_rps", 1.5)),
     )
 
 
