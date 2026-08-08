@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
+from tools.interpolate_tokenizer_checkpoints import interpolate_model_states
 from vision_action_tokenizer.losses import LossConfig, TokenizerLoss, trajectory_xy_loss
 from vision_action_tokenizer.models.decoder import (
     SE2IncrementDecoder,
@@ -162,6 +164,63 @@ def test_mean_residual_register_starts_exactly_from_mean_model() -> None:
     assert torch.equal(mean_output.action_tokens, residual_output.action_tokens)
     assert torch.equal(mean_output.reconstruction, residual_output.reconstruction)
     assert torch.count_nonzero(residual_model.encoder.register_residual_gate) == 0
+
+
+def test_zero_output_residual_is_exact_but_receives_immediate_gradient() -> None:
+    torch.manual_seed(7)
+    common = {
+        "vggt_feature_dim": 32,
+        "frame_geometry_dim": 16,
+        "action_token_dim": 8,
+        "num_action_tokens": 4,
+        "steps_per_token": 10,
+        "decoder_hidden_dim": 32,
+        "decoder_parameterization": "velocity",
+    }
+    mean_model = VisionActionTokenizer(**common, register_pooling="mean").eval()
+    residual_model = VisionActionTokenizer(
+        **common,
+        register_pooling="mean_residual",
+        register_token_count=16,
+        register_residual_dim=8,
+        register_residual_gate_init=3.0,
+        register_residual_zero_init=True,
+    ).eval()
+    residual_model.load_state_dict(mean_model.state_dict(), strict=False)
+    camera = torch.randn(2, 5, 32)
+    register_mean = torch.randn(2, 5, 32)
+    registers = torch.randn(2, 5, 16, 32)
+    frame_times = torch.arange(5).float().repeat(2, 1)
+    future_times = torch.arange(1, 41).float().repeat(2, 1) / 10
+
+    mean_output = mean_model(camera, register_mean, frame_times, future_times)
+    residual_output = residual_model(
+        camera,
+        register_mean,
+        frame_times,
+        future_times,
+        register_hidden=registers,
+    )
+    assert torch.equal(mean_output.reconstruction, residual_output.reconstruction)
+    target = torch.randn_like(residual_output.reconstruction)
+    loss = (residual_output.reconstruction - target).square().mean()
+    loss.backward()
+    output = residual_model.encoder.register_residual_output
+    assert isinstance(output, torch.nn.Linear)
+    assert output.weight.grad is not None
+    assert torch.count_nonzero(output.weight.grad) > 0
+
+
+def test_checkpoint_interpolation_is_strict() -> None:
+    left = {"weight": torch.tensor([0.0, 2.0]), "count": torch.tensor(3)}
+    right = {"weight": torch.tensor([2.0, 4.0]), "count": torch.tensor(3)}
+    result = interpolate_model_states(left, right, alpha=0.25)
+    assert torch.equal(result["weight"], torch.tensor([0.5, 2.5]))
+    assert result["count"].item() == 3
+    with pytest.raises(ValueError, match="keys differ"):
+        interpolate_model_states(left, {"other": torch.ones(1)}, alpha=0.5)
+    with pytest.raises(ValueError, match="Non-floating"):
+        interpolate_model_states(left, {**right, "count": torch.tensor(4)}, alpha=0.5)
 
 
 def test_full_vggt_tokenizer_loss_backward() -> None:

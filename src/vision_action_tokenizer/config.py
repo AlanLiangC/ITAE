@@ -61,6 +61,9 @@ def resolve_resume_checkpoint(
     if normalized.lower() in {"", "none", "off", "false"}:
         return None
     if normalized.lower() in {"auto", "latest"}:
+        last_checkpoint = output / "last.pt"
+        if last_checkpoint.is_file():
+            return last_checkpoint
         candidates = [path for path in output.glob("*.pt") if path.is_file()]
         if not candidates:
             return None

@@ -104,6 +104,7 @@ class TokenizerTrainer:
         self.config = config or {}
         self.global_step = 0
         self.best_ade = math.inf
+        self.best_trained_ade = math.inf
         train_config = self.config.get("train", {})
         self.early_stopping_patience = int(
             train_config.get("early_stopping_patience", 0)
@@ -112,10 +113,24 @@ class TokenizerTrainer:
             train_config.get("early_stopping_min_delta", 0.0)
         )
         self.epochs_without_improvement = 0
+        self.freeze_base_epochs = int(train_config.get("freeze_base_epochs", 0))
+        self._initial_requires_grad = {
+            name: parameter.requires_grad
+            for name, parameter in self.model.named_parameters()
+        }
+        self._base_frozen: bool | None = None
         if self.early_stopping_patience < 0:
             raise ValueError("train.early_stopping_patience must be non-negative")
         if self.early_stopping_min_delta < 0:
             raise ValueError("train.early_stopping_min_delta must be non-negative")
+        if self.freeze_base_epochs < 0:
+            raise ValueError("train.freeze_base_epochs must be non-negative")
+        if self.freeze_base_epochs and context.world_size > 1:
+            raise ValueError("Staged base freezing currently supports one process")
+        if self.freeze_base_epochs and not any(
+            "register_residual_" in name for name in self._initial_requires_grad
+        ):
+            raise ValueError("Staged base freezing requires a register residual adapter")
         self.scaler = torch.amp.GradScaler(
             "cuda", enabled=precision == "fp16" and context.device.type == "cuda"
         )
@@ -166,6 +181,7 @@ class TokenizerTrainer:
     ) -> None:
         try:
             for epoch in range(start_epoch, epochs):
+                self._configure_trainable_parameters(epoch)
                 sampler = getattr(train_loader, "sampler", None)
                 if hasattr(sampler, "set_epoch"):
                     sampler.set_epoch(epoch)
@@ -175,6 +191,11 @@ class TokenizerTrainer:
                 is_best = ade < self.best_ade - self.early_stopping_min_delta
                 if is_best:
                     self.best_ade = ade
+                is_best_trained = (
+                    ade < self.best_trained_ade - self.early_stopping_min_delta
+                )
+                if is_best_trained:
+                    self.best_trained_ade = ade
                     self.epochs_without_improvement = 0
                 else:
                     self.epochs_without_improvement += 1
@@ -186,6 +207,8 @@ class TokenizerTrainer:
                     self.save_checkpoint("last.pt", epoch)
                     if is_best:
                         self.save_checkpoint("best.pt", epoch)
+                    if is_best_trained:
+                        self.save_checkpoint("best_trained.pt", epoch)
                 should_stop = (
                     self.early_stopping_patience > 0
                     and self.epochs_without_improvement >= self.early_stopping_patience
@@ -202,7 +225,8 @@ class TokenizerTrainer:
                             "Early stopping: validation ADE did not improve by "
                             f"{self.early_stopping_min_delta:g} m for "
                             f"{self.epochs_without_improvement} epochs; "
-                            f"best={self.best_ade:.5f} m",
+                            f"best_trained={self.best_trained_ade:.5f} m, "
+                            f"deployment_best={self.best_ade:.5f} m",
                             flush=True,
                         )
                     break
@@ -216,8 +240,32 @@ class TokenizerTrainer:
         enabled = self.precision != "fp32" and self.context.device.type == "cuda"
         return torch.autocast(self.context.device.type, dtype=dtype, enabled=enabled)
 
+    def _configure_trainable_parameters(self, epoch: int) -> None:
+        freeze_base = epoch < self.freeze_base_epochs
+        for name, parameter in self.model.named_parameters():
+            initially_trainable = self._initial_requires_grad[name]
+            is_residual = "register_residual_" in name
+            parameter.requires_grad_(
+                initially_trainable and (not freeze_base or is_residual)
+            )
+        if freeze_base != self._base_frozen:
+            self._base_frozen = freeze_base
+            if self.context.is_main:
+                state = "frozen" if freeze_base else "trainable"
+                print(f"Base tokenizer parameters are now {state} at epoch {epoch}", flush=True)
+
     def _train_epoch(self, loader: Any, epoch: int, log_every: int) -> None:
         self.model.train()
+        if self._base_frozen:
+            # Keep the warm-started motion path deterministic while the new adapter
+            # learns its first non-zero correction.
+            self.model.eval()
+            unwrapped = _unwrap(self.model)
+            tokenizer = getattr(unwrapped, "tokenizer", unwrapped)
+            encoder = tokenizer.encoder
+            encoder.register_residual_projection.train()
+            encoder.register_residual_fusion.train()
+            encoder.register_residual_output.train()
         running: dict[str, float] = defaultdict(float)
         for batch_index, raw_batch in enumerate(loader):
             batch = _to_device(raw_batch, self.context.device)
@@ -265,6 +313,7 @@ class TokenizerTrainer:
                     group_name = str(group.get("name", group_index))
                     step_metrics[f"optimization/lr_{group_name}"] = group["lr"]
                 step_metrics["optimization/grad_norm"] = grad_norm.detach()
+                step_metrics["progress/base_frozen"] = float(bool(self._base_frozen))
                 self._write_scalars("train", step_metrics, self.global_step)
             if self.context.is_main and (batch_index + 1) % log_every == 0:
                 averaged = {key: value / log_every for key, value in running.items()}
@@ -376,6 +425,7 @@ class TokenizerTrainer:
             "epoch": epoch,
             "global_step": self.global_step,
             "best_ade": self.best_ade,
+            "best_trained_ade": self.best_trained_ade,
             "epochs_without_improvement": self.epochs_without_improvement,
             "config": self.config,
             "torch_rng_state": torch.get_rng_state(),
@@ -408,6 +458,11 @@ class TokenizerTrainer:
         self.scaler.load_state_dict(checkpoint["scaler"])
         self.global_step = int(checkpoint["global_step"])
         self.best_ade = float(checkpoint["best_ade"])
+        # Older checkpoints predate the separate trained-model metric. Falling
+        # back to best_ade preserves their early-stopping state on resume.
+        self.best_trained_ade = float(
+            checkpoint.get("best_trained_ade", checkpoint["best_ade"])
+        )
         self.epochs_without_improvement = int(
             checkpoint.get("epochs_without_improvement", 0)
         )

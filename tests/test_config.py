@@ -8,7 +8,7 @@ import pytest
 from vision_action_tokenizer.config import resolve_resume_checkpoint
 
 
-def test_auto_resume_selects_latest_checkpoint(tmp_path: Path) -> None:
+def test_auto_resume_prefers_last_checkpoint(tmp_path: Path) -> None:
     last = tmp_path / "last.pt"
     best = tmp_path / "best.pt"
     last.touch()
@@ -16,7 +16,17 @@ def test_auto_resume_selects_latest_checkpoint(tmp_path: Path) -> None:
     os.utime(last, ns=(1_000, 1_000))
     os.utime(best, ns=(2_000, 2_000))
     config = {"train": {"resume": "auto"}}
-    assert resolve_resume_checkpoint(config, tmp_path) == best
+    assert resolve_resume_checkpoint(config, tmp_path) == last
+
+
+def test_auto_resume_uses_latest_checkpoint_without_last(tmp_path: Path) -> None:
+    first = tmp_path / "best.pt"
+    second = tmp_path / "best_trained.pt"
+    first.touch()
+    second.touch()
+    os.utime(first, ns=(1_000, 1_000))
+    os.utime(second, ns=(2_000, 2_000))
+    assert resolve_resume_checkpoint({"train": {"resume": "auto"}}, tmp_path) == second
 
 
 def test_resume_priority_and_fresh_override(tmp_path: Path) -> None:

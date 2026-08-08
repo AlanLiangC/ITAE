@@ -120,3 +120,44 @@ torchrun --standalone --nproc_per_node=1 tools/train_tokenizer.py \
 
 它把 stationary 权重恢复到 `1.0`，并将首尾 1 秒平均速度相差超过 `0.5 m/s` 的 accelerate /
 decelerate 窗口各加权 `1.25`。必须在第一组之后再跑，避免同时改变结构和采样后无法归因。
+
+## V3 与 dynamics 结论、V3.1
+
+V3 普通版和 dynamics 版都没有替换初始化的 motion `best.pt`。Dynamics last 的全量 ADE 为
+`0.3374 m`；它改善 accelerating FDE，但 steady 和 decelerating 明显退化。两组训练的 gate
+mean 都只有约 `9e-4`，且跨样本打乱 centered register 几乎不改变输出，说明 full-register
+分支仍未学到输入相关修正。
+
+V3.1 用“零输出层”替代“零 gate”：
+
+- residual 最后额外增加一个 zero-initialized linear，因此初始重建仍与 motion 逐位相同；
+- gate 初始化为 `3.0`，经 `tanh` 后约为 `0.995`，输出层从第一个 step 就有有效梯度；
+- 前 10 epoch 将 motion 主路径设为 eval 且冻结，只训练 residual adapter；
+- 之后主路径以 residual 学习率的 `0.05` 倍联合微调；
+- `best_trained.pt` 独立跟踪训练态，早停也跟踪它；`best.pt` 仍只在超过安全基线时更新；
+- `resume: auto` 明确优先 `last.pt`，不会误选更新时间更晚的 best checkpoint。
+
+```bash
+torchrun --standalone --nproc_per_node=1 tools/train_tokenizer.py \
+  --config configs/nuscenes_vggt_omega_front_4s_v3_1_zero_init_residual.yaml \
+  --train-manifest data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
+  --val-manifest data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl \
+  --output output/itae_vggt_omega_v3_1_zero_init_residual
+```
+
+该实验重新使用 V2 motion 的采样分布，不启用 dynamics 权重。只有 trained residual 在
+register shuffle 消融中产生明确退化后，才值得重新引入加速/减速采样或模型容量实验。
+
+如果 `best_trained.pt` 与初始化表现接近但误差互补，可生成预先固定的 0.5 权重 soup：
+
+```bash
+python tools/interpolate_tokenizer_checkpoints.py \
+  --left output/itae_vggt_omega_v3_1_zero_init_residual/initial.pt \
+  --right output/itae_vggt_omega_v3_1_zero_init_residual/best_trained.pt \
+  --alpha 0.5 \
+  --output output/itae_vggt_omega_v3_1_zero_init_residual/soup_0.5.pt
+```
+
+该工具严格检查 state key、shape、dtype 和非浮点 buffer；输出只用于 evaluation/export，不能
+作为完整 optimizer resume checkpoint。不要在 val 上搜索大量 alpha 后再把同一 val 当作无偏
+结果；`0.5` 应作为事先固定的诊断候选。

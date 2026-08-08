@@ -188,6 +188,34 @@ validation ADE 才会替换它。另有
 `nuscenes_vggt_omega_front_4s_v3_residual_register_dynamics.yaml` 用于第二阶段加速/减速重采样
 消融，不应与第一组共用 output。
 
+V3/V3-dynamics 均确认零 gate 令 register adapter 冷启动。修正后的推荐配置是 V3.1：残差
+输出投影零初始化但 gate 保持开启，前 10 epoch 冻结 motion 主路径。训练同时保存：
+
+- `best.pt`：不会差于 warm-start motion 的安全部署权重；
+- `best_trained.pt`：本次训练内部最优权重，用于诊断和权重平均；
+- `last.pt`：唯一的自动恢复优先入口。
+
+```bash
+torchrun --standalone --nproc_per_node=1 \
+  tools/train_tokenizer.py \
+  --config configs/nuscenes_vggt_omega_front_4s_v3_1_zero_init_residual.yaml \
+  --train-manifest data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
+  --val-manifest data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl \
+  --output output/itae_vggt_omega_v3_1_zero_init_residual
+```
+
+训练后可用固定 `0.5` 系数生成单模型权重平均候选，再用完整 evaluator 判断是否保留：
+
+```bash
+python tools/interpolate_tokenizer_checkpoints.py \
+  --left output/itae_vggt_omega_v3_1_zero_init_residual/initial.pt \
+  --right output/itae_vggt_omega_v3_1_zero_init_residual/best_trained.pt \
+  --alpha 0.5 \
+  --output output/itae_vggt_omega_v3_1_zero_init_residual/soup_0.5.pt
+```
+
+`resume: auto` 始终优先 `last.pt`，因此同目录的 soup/evaluation checkpoint 不会干扰续训。
+
 ## 4. 评估与 action latent 导出
 
 ```bash

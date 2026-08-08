@@ -38,6 +38,8 @@ class IntervalActionEncoder(nn.Module):
         register_pool_dim: int = 128,
         register_token_count: int = 16,
         register_residual_dim: int = 32,
+        register_residual_gate_init: float = 0.0,
+        register_residual_zero_init: bool = False,
     ) -> None:
         super().__init__()
         if register_pooling not in {"mean", "attention", "mean_residual"}:
@@ -64,6 +66,8 @@ class IntervalActionEncoder(nn.Module):
             if register_pooling == "mean_residual":
                 if register_token_count <= 0 or register_residual_dim <= 0:
                     raise ValueError("Residual register dimensions must be positive")
+                if not math.isfinite(register_residual_gate_init):
+                    raise ValueError("register_residual_gate_init must be finite")
                 self.register_token_count = register_token_count
                 self.register_residual_projection = nn.Sequential(
                     nn.LayerNorm(input_dim),
@@ -80,8 +84,20 @@ class IntervalActionEncoder(nn.Module):
                     nn.LayerNorm(frame_geometry_dim),
                 )
                 self.register_residual_gate = nn.Parameter(
-                    torch.zeros(frame_geometry_dim)
+                    torch.full(
+                        (frame_geometry_dim,), float(register_residual_gate_init)
+                    )
                 )
+                if register_residual_zero_init:
+                    self.register_residual_output: nn.Module = nn.Linear(
+                        frame_geometry_dim, frame_geometry_dim
+                    )
+                    output = self.register_residual_output
+                    assert isinstance(output, nn.Linear)
+                    nn.init.zeros_(output.weight)
+                    nn.init.zeros_(output.bias)
+                else:
+                    self.register_residual_output = nn.Identity()
         else:
             if register_summary_tokens <= 0 or register_pool_dim <= 0:
                 raise ValueError("Register attention dimensions must be positive")
@@ -169,6 +185,7 @@ class IntervalActionEncoder(nn.Module):
             centered = register_hidden.float() - register_hidden_mean.float().unsqueeze(2)
             residual = self.register_residual_projection(centered).flatten(2)
             residual = self.register_residual_fusion(residual)
+            residual = self.register_residual_output(residual)
             gate = torch.tanh(self.register_residual_gate).view(1, 1, -1)
             return geometry + gate * residual
 
@@ -238,6 +255,8 @@ class VisionActionTokenizer(nn.Module):
         register_pool_dim: int = 128,
         register_token_count: int = 16,
         register_residual_dim: int = 32,
+        register_residual_gate_init: float = 0.0,
+        register_residual_zero_init: bool = False,
         decoder_parameterization: str = "displacement",
         initial_forward_speed_mps: float = 5.0,
         max_forward_speed_mps: float = 40.0,
@@ -260,6 +279,8 @@ class VisionActionTokenizer(nn.Module):
             register_pool_dim=register_pool_dim,
             register_token_count=register_token_count,
             register_residual_dim=register_residual_dim,
+            register_residual_gate_init=register_residual_gate_init,
+            register_residual_zero_init=register_residual_zero_init,
         )
         self.decoder = SE2IncrementDecoder(
             action_dim=action_token_dim,
