@@ -79,3 +79,44 @@ torchrun --standalone --nproc_per_node=1 tools/train_tokenizer.py \
 
 判断标准：motion 明显提升说明瓶颈主要在运动参数化；large 进一步提升才支持继续加参数；rich
 提升而 large 不提升则说明 mean cache 是主要信息瓶颈。
+
+## 已完成结果与 V3
+
+V2 motion 全量 val ADE 为 `0.3275 m`。原 attention-rich 模型为 `0.3497 m`，且四个
+register query 的 attention map cosine 接近 `1.0`，说明 summary query 塌缩。另一方面，打乱
+rich register 会令 ADE 恶化到 `0.556 m`，并且 `0.7 × motion + 0.3 × rich` 的轨迹融合可达到
+约 `0.3203 m`，证明 full-register 仍包含互补信息。
+
+V3 不再用多个可交换 query。它保留 motion 的 mean 路径，用固定 register slot 的低秩展开
+预测残差，并用零初始化逐通道 gate 融合：
+
+```text
+frame_geometry = frozen-compatible motion_mean_path
+               + tanh(zero_initialized_gate) * centered_register_residual
+```
+
+推荐先跑严格结构消融：
+
+```bash
+torchrun --standalone --nproc_per_node=1 tools/train_tokenizer.py \
+  --config configs/nuscenes_vggt_omega_front_4s_v3_residual_register.yaml \
+  --train-manifest data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
+  --val-manifest data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl \
+  --output output/itae_vggt_omega_v3_residual_register
+```
+
+该配置自动从 `output/itae_vggt_omega_v2_motion/best.pt` 初始化。主路径学习率是 residual
+adapter 的 `0.1` 倍；新 output 已有 checkpoint 时优先正常 resume，不会再次 warm-start。
+
+第二组仅用于判断速度趋势重采样的收益：
+
+```bash
+torchrun --standalone --nproc_per_node=1 tools/train_tokenizer.py \
+  --config configs/nuscenes_vggt_omega_front_4s_v3_residual_register_dynamics.yaml \
+  --train-manifest data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
+  --val-manifest data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl \
+  --output output/itae_vggt_omega_v3_residual_register_dynamics
+```
+
+它把 stationary 权重恢复到 `1.0`，并将首尾 1 秒平均速度相差超过 `0.5 m/s` 的 accelerate /
+decelerate 窗口各加权 `1.25`。必须在第一组之后再跑，避免同时改变结构和采样后无法归因。

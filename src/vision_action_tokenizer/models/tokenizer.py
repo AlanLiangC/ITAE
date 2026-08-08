@@ -36,18 +36,23 @@ class IntervalActionEncoder(nn.Module):
         register_pooling: str = "mean",
         register_summary_tokens: int = 4,
         register_pool_dim: int = 128,
+        register_token_count: int = 16,
+        register_residual_dim: int = 32,
     ) -> None:
         super().__init__()
-        if register_pooling not in {"mean", "attention"}:
-            raise ValueError("register_pooling must be `mean` or `attention`")
+        if register_pooling not in {"mean", "attention", "mean_residual"}:
+            raise ValueError(
+                "register_pooling must be `mean`, `attention` or `mean_residual`"
+            )
         if interval_mixer_layers < 0:
             raise ValueError("interval_mixer_layers must be non-negative")
         if interval_mixer_layers and action_dim % interval_mixer_heads:
             raise ValueError("action_dim must be divisible by interval_mixer_heads")
         self.frame_geometry_dim = frame_geometry_dim
         self.register_pooling = register_pooling
-        if register_pooling == "mean":
-            # Keep the V1 module names and shapes so its checkpoints remain loadable.
+        if register_pooling in {"mean", "mean_residual"}:
+            # Keep the V2-motion module names and shapes so it can initialize the
+            # residual model exactly, before any full-register contribution is added.
             self.frame_projection = nn.Sequential(
                 nn.LayerNorm(input_dim * 2),
                 nn.Linear(input_dim * 2, frame_geometry_dim),
@@ -56,6 +61,27 @@ class IntervalActionEncoder(nn.Module):
                 nn.Linear(frame_geometry_dim, frame_geometry_dim),
                 nn.LayerNorm(frame_geometry_dim),
             )
+            if register_pooling == "mean_residual":
+                if register_token_count <= 0 or register_residual_dim <= 0:
+                    raise ValueError("Residual register dimensions must be positive")
+                self.register_token_count = register_token_count
+                self.register_residual_projection = nn.Sequential(
+                    nn.LayerNorm(input_dim),
+                    nn.Linear(input_dim, register_residual_dim, bias=False),
+                    nn.GELU(),
+                )
+                flattened_dim = register_token_count * register_residual_dim
+                self.register_residual_fusion = nn.Sequential(
+                    nn.LayerNorm(flattened_dim),
+                    nn.Linear(flattened_dim, frame_geometry_dim),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(frame_geometry_dim, frame_geometry_dim),
+                    nn.LayerNorm(frame_geometry_dim),
+                )
+                self.register_residual_gate = nn.Parameter(
+                    torch.zeros(frame_geometry_dim)
+                )
         else:
             if register_summary_tokens <= 0 or register_pool_dim <= 0:
                 raise ValueError("Register attention dimensions must be positive")
@@ -114,7 +140,7 @@ class IntervalActionEncoder(nn.Module):
         register_hidden_mean: Tensor | None,
         register_hidden: Tensor | None,
     ) -> Tensor:
-        if self.register_pooling == "mean":
+        if self.register_pooling in {"mean", "mean_residual"}:
             if register_hidden_mean is None or camera_hidden.shape != register_hidden_mean.shape:
                 raise ValueError(
                     "Mean pooling requires camera_hidden and register_hidden_mean [B,F,C]"
@@ -122,7 +148,29 @@ class IntervalActionEncoder(nn.Module):
             inputs = torch.cat(
                 [camera_hidden.float(), register_hidden_mean.float()], dim=-1
             )
-            return self.frame_projection(inputs)
+            geometry = self.frame_projection(inputs)
+            if self.register_pooling == "mean":
+                return geometry
+            if register_hidden is None or register_hidden.ndim != 4:
+                raise ValueError(
+                    "Mean-residual pooling requires register_hidden [B,F,R,C]"
+                )
+            expected_shape = (
+                camera_hidden.shape[0],
+                camera_hidden.shape[1],
+                self.register_token_count,
+                camera_hidden.shape[2],
+            )
+            if tuple(register_hidden.shape) != expected_shape:
+                raise ValueError(
+                    "register_hidden shape does not match mean-residual configuration: "
+                    f"{tuple(register_hidden.shape)} != {expected_shape}"
+                )
+            centered = register_hidden.float() - register_hidden_mean.float().unsqueeze(2)
+            residual = self.register_residual_projection(centered).flatten(2)
+            residual = self.register_residual_fusion(residual)
+            gate = torch.tanh(self.register_residual_gate).view(1, 1, -1)
+            return geometry + gate * residual
 
         if register_hidden is None or register_hidden.ndim != 4:
             raise ValueError("Attention pooling requires register_hidden [B,F,R,C]")
@@ -188,6 +236,8 @@ class VisionActionTokenizer(nn.Module):
         register_pooling: str = "mean",
         register_summary_tokens: int = 4,
         register_pool_dim: int = 128,
+        register_token_count: int = 16,
+        register_residual_dim: int = 32,
         decoder_parameterization: str = "displacement",
         initial_forward_speed_mps: float = 5.0,
         max_forward_speed_mps: float = 40.0,
@@ -208,6 +258,8 @@ class VisionActionTokenizer(nn.Module):
             register_pooling=register_pooling,
             register_summary_tokens=register_summary_tokens,
             register_pool_dim=register_pool_dim,
+            register_token_count=register_token_count,
+            register_residual_dim=register_residual_dim,
         )
         self.decoder = SE2IncrementDecoder(
             action_dim=action_token_dim,

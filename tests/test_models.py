@@ -120,6 +120,50 @@ def test_rich_register_attention_tokenizer_backward() -> None:
     assert tokenizer.encoder.register_queries.grad is not None
 
 
+def test_mean_residual_register_starts_exactly_from_mean_model() -> None:
+    torch.manual_seed(5)
+    common = {
+        "vggt_feature_dim": 32,
+        "frame_geometry_dim": 16,
+        "action_token_dim": 8,
+        "num_action_tokens": 4,
+        "steps_per_token": 10,
+        "decoder_hidden_dim": 32,
+        "interval_mixer_layers": 1,
+        "interval_mixer_heads": 2,
+        "decoder_parameterization": "velocity",
+    }
+    mean_model = VisionActionTokenizer(**common, register_pooling="mean").eval()
+    residual_model = VisionActionTokenizer(
+        **common,
+        register_pooling="mean_residual",
+        register_token_count=16,
+        register_residual_dim=8,
+    ).eval()
+    incompatible = residual_model.load_state_dict(mean_model.state_dict(), strict=False)
+    assert not incompatible.unexpected_keys
+    assert incompatible.missing_keys
+    assert all(key.startswith("encoder.register_residual_") for key in incompatible.missing_keys)
+
+    camera = torch.randn(2, 5, 32)
+    register_mean = torch.randn(2, 5, 32)
+    registers = torch.randn(2, 5, 16, 32)
+    frame_times = torch.arange(5).float().repeat(2, 1)
+    future_times = torch.arange(1, 41).float().repeat(2, 1) / 10
+    with torch.no_grad():
+        mean_output = mean_model(camera, register_mean, frame_times, future_times)
+        residual_output = residual_model(
+            camera,
+            register_mean,
+            frame_times,
+            future_times,
+            register_hidden=registers,
+        )
+    assert torch.equal(mean_output.action_tokens, residual_output.action_tokens)
+    assert torch.equal(mean_output.reconstruction, residual_output.reconstruction)
+    assert torch.count_nonzero(residual_model.encoder.register_residual_gate) == 0
+
+
 def test_full_vggt_tokenizer_loss_backward() -> None:
     tokenizer = VisionActionTokenizer(
         vggt_feature_dim=32,

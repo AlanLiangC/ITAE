@@ -49,6 +49,8 @@ def build_tokenizer(config: dict[str, Any]) -> VisionActionTokenizer:
         register_pooling=str(action.get("register_pooling", "mean")),
         register_summary_tokens=int(action.get("register_summary_tokens", 4)),
         register_pool_dim=int(action.get("register_pool_dim", 128)),
+        register_token_count=int(action.get("register_token_count", 16)),
+        register_residual_dim=int(action.get("register_residual_dim", 32)),
         decoder_parameterization=str(
             action.get("decoder_parameterization", "displacement")
         ),

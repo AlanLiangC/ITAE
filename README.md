@@ -171,6 +171,23 @@ torchrun --standalone --nproc_per_node=1 \
 cache 命令和比较指标见
 [`docs/VGGT_OMEGA_V2_EXPERIMENTS.md`](docs/VGGT_OMEGA_V2_EXPERIMENTS.md)。
 
+Rich attention 实验未超过 motion，并发现多个 learned query 塌缩。V3 改为从 motion
+`best.pt` warm-start 的零门控 residual-register adapter；初始化时输出与 motion 逐位一致：
+
+```bash
+torchrun --standalone --nproc_per_node=1 \
+  tools/train_tokenizer.py \
+  --config configs/nuscenes_vggt_omega_front_4s_v3_residual_register.yaml \
+  --train-manifest data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
+  --val-manifest data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl \
+  --output output/itae_vggt_omega_v3_residual_register
+```
+
+V3 会在新 output 中保存 `initial.pt`，并把它同时作为初始 `best.pt`；只有超过 motion 的
+validation ADE 才会替换它。另有
+`nuscenes_vggt_omega_front_4s_v3_residual_register_dynamics.yaml` 用于第二阶段加速/减速重采样
+消融，不应与第一组共用 output。
+
 ## 4. 评估与 action latent 导出
 
 ```bash

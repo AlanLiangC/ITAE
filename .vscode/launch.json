@@ -103,6 +103,26 @@
             }
         },
         {
+            "name": "ITAE VGGT V3: Train residual register",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/alan/miniconda3/envs/py312torch210cu126/bin/python",
+            "program": "${workspaceFolder}/tools/train_tokenizer.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": [
+                "--config", "${workspaceFolder}/configs/nuscenes_vggt_omega_front_4s_v3_residual_register.yaml",
+                "--train-manifest", "${workspaceFolder}/data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl",
+                "--val-manifest", "${workspaceFolder}/data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl",
+                "--output", "${workspaceFolder}/output/itae_vggt_omega_v3_residual_register"
+            ],
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+            }
+        },
+        {
             "name": "ITAE VGGT: Evaluate tokenizer",
             "type": "debugpy",
             "request": "launch",

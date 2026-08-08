@@ -98,6 +98,33 @@ def motion_bucket(window: WindowRecord) -> str:
     return "straight_slow" if distance < 20.0 else "straight_fast"
 
 
+def speed_trend(
+    window: WindowRecord,
+    steps_per_interval: int,
+    threshold_mps: float,
+) -> str:
+    """Classify acceleration from the first and last one-second mean speeds."""
+    if motion_bucket(window) == "stationary":
+        return "stationary"
+    trajectory = torch.as_tensor(window.trajectory, dtype=torch.float32)
+    times = torch.as_tensor(window.future_times_s, dtype=torch.float32)
+    if len(trajectory) < 2 * steps_per_interval or len(times) != len(trajectory):
+        raise ValueError("Trajectory is too short for configured speed-trend intervals")
+    previous_xy = torch.cat([torch.zeros_like(trajectory[:1, :2]), trajectory[:-1, :2]])
+    delta_t = torch.diff(torch.cat([torch.zeros_like(times[:1]), times]))
+    if torch.any(delta_t <= 0):
+        raise ValueError("Manifest future_times_s must be strictly increasing")
+    speed = torch.linalg.vector_norm(trajectory[:, :2] - previous_xy, dim=-1) / delta_t
+    speed_change = float(
+        speed[-steps_per_interval:].mean() - speed[:steps_per_interval].mean()
+    )
+    if speed_change > threshold_mps:
+        return "accelerating"
+    if speed_change < -threshold_mps:
+        return "decelerating"
+    return "steady"
+
+
 def make_motion_sampler(
     manifest: Path,
     config: dict,
@@ -122,6 +149,26 @@ def make_motion_sampler(
     bucket_weights = {name: float(value) for name, value in configured.items()}
     if any(value <= 0 for value in bucket_weights.values()):
         raise ValueError("Motion bucket weights must all be positive")
+    configured_trends = balancing.get("speed_trend_weights")
+    trend_names = {"stationary", "steady", "accelerating", "decelerating"}
+    if configured_trends is None:
+        trend_weights = {name: 1.0 for name in trend_names}
+    else:
+        if set(configured_trends) != trend_names:
+            raise ValueError(
+                "train.motion_balancing.speed_trend_weights must define exactly "
+                f"{sorted(trend_names)}"
+            )
+        trend_weights = {
+            name: float(value) for name, value in configured_trends.items()
+        }
+        if any(value <= 0 for value in trend_weights.values()):
+            raise ValueError("Speed-trend weights must all be positive")
+    trend_threshold = float(
+        balancing.get("speed_trend_threshold_mps", 0.5)
+    )
+    if trend_threshold <= 0:
+        raise ValueError("speed_trend_threshold_mps must be positive")
 
     windows = load_manifest(manifest)
     if overfit_samples is not None:
@@ -131,20 +178,38 @@ def make_motion_sampler(
             f"Sampler manifest/dataset mismatch: {len(windows)} != {dataset_size}"
         )
     buckets = [motion_bucket(window) for window in windows]
+    trends = [
+        speed_trend(
+            window,
+            steps_per_interval=int(config["action_tokenizer"]["steps_per_token"]),
+            threshold_mps=trend_threshold,
+        )
+        for window in windows
+    ]
     sample_weights = torch.tensor(
-        [bucket_weights[bucket] for bucket in buckets], dtype=torch.double
+        [
+            bucket_weights[bucket] * trend_weights[trend]
+            for bucket, trend in zip(buckets, trends, strict=True)
+        ],
+        dtype=torch.double,
     )
     generator = torch.Generator().manual_seed(int(config["seed"]))
     counts = Counter(buckets)
+    trend_counts = Counter(trends)
     weighted_counts = {
-        name: counts[name] * bucket_weights[name] for name in sorted(bucket_names)
+        name: sum(
+            float(weight)
+            for bucket, weight in zip(buckets, sample_weights, strict=True)
+            if bucket == name
+        )
+        for name in sorted(bucket_names)
     }
     normalization = sum(weighted_counts.values())
     expected = {
         name: weighted_counts[name] / normalization for name in sorted(bucket_names)
     }
     print(
-        f"Motion-balanced sampling counts={dict(counts)} "
+        f"Motion-balanced sampling counts={dict(counts)} trends={dict(trend_counts)} "
         f"expected_fractions={expected}",
         flush=True,
     )
@@ -234,13 +299,54 @@ def main() -> None:
             model,
             device_ids=[context.local_rank] if context.device.type == "cuda" else None,
         )
-    parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
-    # print trainable parameters
-    total_params = sum(p.numel() for p in parameters)
+    named_parameters = [
+        (name, parameter)
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    ]
+    parameters = [parameter for _, parameter in named_parameters]
+    total_params = sum(parameter.numel() for parameter in parameters)
     print(f"Total trainable parameters: {total_params:,}")
+    learning_rate = float(config["train"]["learning_rate"])
+    base_learning_rate_scale = float(
+        config["train"].get("base_learning_rate_scale", 1.0)
+    )
+    if base_learning_rate_scale <= 0:
+        raise ValueError("train.base_learning_rate_scale must be positive")
+    residual_parameters = [
+        parameter
+        for name, parameter in named_parameters
+        if "register_residual_" in name
+    ]
+    residual_parameter_ids = {id(parameter) for parameter in residual_parameters}
+    base_parameters = [
+        parameter for parameter in parameters if id(parameter) not in residual_parameter_ids
+    ]
+    if residual_parameters and base_learning_rate_scale != 1.0:
+        optimizer_groups = [
+            {
+                "params": base_parameters,
+                "lr": learning_rate * base_learning_rate_scale,
+                "name": "base",
+            },
+            {
+                "params": residual_parameters,
+                "lr": learning_rate,
+                "name": "register_residual",
+            },
+        ]
+        print(
+            "Optimizer parameter groups: "
+            f"base={sum(p.numel() for p in base_parameters):,} "
+            f"lr={learning_rate * base_learning_rate_scale:g}; "
+            f"register_residual={sum(p.numel() for p in residual_parameters):,} "
+            f"lr={learning_rate:g}",
+            flush=True,
+        )
+    else:
+        optimizer_groups = [{"params": parameters, "lr": learning_rate, "name": "all"}]
     optimizer = torch.optim.AdamW(
-        parameters,
-        lr=float(config["train"]["learning_rate"]),
+        optimizer_groups,
         weight_decay=float(config["train"]["weight_decay"]),
     )
     total_steps = max(1, len(train_loader) * int(config["train"]["epochs"]))
@@ -269,7 +375,19 @@ def main() -> None:
         grad_clip_norm=float(config["train"]["grad_clip_norm"]),
         config=config,
     )
-    start_epoch = trainer.load_checkpoint(resume_checkpoint) if resume_checkpoint else 0
+    if resume_checkpoint is not None:
+        start_epoch = trainer.load_checkpoint(resume_checkpoint)
+    else:
+        start_epoch = 0
+        initial_checkpoint = config["train"].get("initial_checkpoint")
+        if initial_checkpoint not in (None, ""):
+            trainer.load_initial_weights(
+                initial_checkpoint,
+                allowed_missing_prefixes=("tokenizer.encoder.register_residual_",),
+            )
+            if context.is_main:
+                trainer.save_checkpoint("initial.pt", epoch=-1)
+                trainer.save_checkpoint("best.pt", epoch=-1)
     try:
         trainer.fit(
             train_loader,

@@ -47,6 +47,20 @@ def _checkpoint_model_state(model: nn.Module) -> dict[str, Tensor]:
     return state
 
 
+def _model_diagnostics(model: nn.Module) -> dict[str, Tensor]:
+    unwrapped = _unwrap(model)
+    tokenizer = getattr(unwrapped, "tokenizer", unwrapped)
+    encoder = getattr(tokenizer, "encoder", None)
+    gate = getattr(encoder, "register_residual_gate", None)
+    if not isinstance(gate, Tensor):
+        return {}
+    activated = torch.tanh(gate.detach())
+    return {
+        "register/gate_abs_mean": activated.abs().mean(),
+        "register/gate_abs_max": activated.abs().max(),
+    }
+
+
 def _load_camera_window(paths_json: str, config: dict[str, Any]) -> Tensor:
     paths = json.loads(paths_json)
     backbone = config["vision_backbone"]
@@ -228,6 +242,7 @@ class TokenizerTrainer:
                     batch["trajectory_mask"],
                     self.global_step,
                 )
+                terms.update(_model_diagnostics(self.model))
             if not torch.isfinite(loss):
                 tokens = batch.get("sample_token", ["unknown"])
                 raise FloatingPointError(f"Non-finite loss at samples {tokens}")
@@ -246,6 +261,9 @@ class TokenizerTrainer:
             if self.context.is_main:
                 step_metrics: dict[str, Any] = dict(terms)
                 step_metrics["optimization/lr"] = self.optimizer.param_groups[0]["lr"]
+                for group_index, group in enumerate(self.optimizer.param_groups):
+                    group_name = str(group.get("name", group_index))
+                    step_metrics[f"optimization/lr_{group_name}"] = group["lr"]
                 step_metrics["optimization/grad_norm"] = grad_norm.detach()
                 self._write_scalars("train", step_metrics, self.global_step)
             if self.context.is_main and (batch_index + 1) % log_every == 0:
@@ -288,6 +306,7 @@ class TokenizerTrainer:
                     batch["trajectory_mask"],
                     self.global_step,
                 )
+                terms.update(_model_diagnostics(self.model))
                 terms.update(
                     trajectory_metrics(
                         output.reconstruction,
@@ -396,6 +415,35 @@ class TokenizerTrainer:
         if torch.cuda.is_available() and checkpoint["cuda_rng_state"] is not None:
             torch.cuda.set_rng_state_all([state.cpu() for state in checkpoint["cuda_rng_state"]])
         return int(checkpoint["epoch"]) + 1
+
+    def load_initial_weights(
+        self,
+        path: str | Path,
+        allowed_missing_prefixes: tuple[str, ...] = (),
+    ) -> None:
+        """Warm-start model weights without importing optimizer or training state."""
+        checkpoint = torch.load(path, map_location=self.context.device, weights_only=False)
+        model = _unwrap(self.model)
+        incompatible = model.load_state_dict(checkpoint["model"], strict=False)
+        invalid_missing = [
+            key
+            for key in incompatible.missing_keys
+            if not key.startswith(allowed_missing_prefixes)
+            and not key.startswith("feature_extractor.model.")
+        ]
+        if invalid_missing or incompatible.unexpected_keys:
+            raise RuntimeError(
+                "Initial checkpoint model mismatch: "
+                f"missing={invalid_missing}, unexpected={incompatible.unexpected_keys}"
+            )
+        if "best_ade" in checkpoint:
+            self.best_ade = float(checkpoint["best_ade"])
+        if self.context.is_main:
+            print(
+                f"Initialized model weights from {path}; "
+                f"new_parameters={incompatible.missing_keys}",
+                flush=True,
+            )
 
     @staticmethod
     def _print_metrics(prefix: str, metrics: dict[str, Any]) -> None:
