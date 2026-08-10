@@ -17,7 +17,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.tensorboard import SummaryWriter
 
 from .data.dataset import VGGTOmegaResize
-from .distributed import DistributedContext, reduce_metrics
+from .distributed import DistributedContext
 from .losses import TokenizerLoss
 from .metrics import trajectory_metrics
 from .visualization import render_vggt_evaluation_diagnostic
@@ -45,6 +45,30 @@ def _checkpoint_model_state(model: nn.Module) -> dict[str, Tensor]:
             if not key.startswith("feature_extractor.model.")
         }
     return state
+
+
+def is_visual_residual_parameter(name: str) -> bool:
+    """Identify both legacy V3 and output-side V4 adapter parameters."""
+    return "register_residual_" in name or "visual_residual_" in name
+
+
+def _reduce_sample_weighted_metrics(
+    weighted_totals: dict[str, Tensor],
+    sample_count: int,
+    world_size: int,
+) -> dict[str, Tensor]:
+    """Reduce metric sums and divide once by the global number of samples."""
+    if sample_count <= 0:
+        raise ValueError("Validation loader is empty")
+    if not weighted_totals:
+        return {}
+    device = next(iter(weighted_totals.values())).device
+    count = torch.tensor(float(sample_count), device=device)
+    if world_size > 1:
+        dist.all_reduce(count, op=dist.ReduceOp.SUM)
+        for value in weighted_totals.values():
+            dist.all_reduce(value, op=dist.ReduceOp.SUM)
+    return {key: value / count for key, value in weighted_totals.items()}
 
 
 def _model_diagnostics(model: nn.Module) -> dict[str, Tensor]:
@@ -106,6 +130,11 @@ class TokenizerTrainer:
         self.best_ade = math.inf
         self.best_trained_ade = math.inf
         train_config = self.config.get("train", {})
+        self.validation_precision = str(
+            train_config.get("validation_precision", precision)
+        )
+        if self.validation_precision not in {"fp32", "fp16", "bf16"}:
+            raise ValueError("train.validation_precision must be fp32, fp16 or bf16")
         self.early_stopping_patience = int(
             train_config.get("early_stopping_patience", 0)
         )
@@ -114,6 +143,7 @@ class TokenizerTrainer:
         )
         self.epochs_without_improvement = 0
         self.freeze_base_epochs = int(train_config.get("freeze_base_epochs", 0))
+        self.freeze_base = bool(train_config.get("freeze_base", False))
         self._initial_requires_grad = {
             name: parameter.requires_grad
             for name, parameter in self.model.named_parameters()
@@ -125,12 +155,12 @@ class TokenizerTrainer:
             raise ValueError("train.early_stopping_min_delta must be non-negative")
         if self.freeze_base_epochs < 0:
             raise ValueError("train.freeze_base_epochs must be non-negative")
-        if self.freeze_base_epochs and context.world_size > 1:
+        if (self.freeze_base or self.freeze_base_epochs) and context.world_size > 1:
             raise ValueError("Staged base freezing currently supports one process")
-        if self.freeze_base_epochs and not any(
-            "register_residual_" in name for name in self._initial_requires_grad
+        if (self.freeze_base or self.freeze_base_epochs) and not any(
+            is_visual_residual_parameter(name) for name in self._initial_requires_grad
         ):
-            raise ValueError("Staged base freezing requires a register residual adapter")
+            raise ValueError("Base freezing requires a visual residual adapter")
         self.scaler = torch.amp.GradScaler(
             "cuda", enabled=precision == "fp16" and context.device.type == "cuda"
         )
@@ -180,6 +210,17 @@ class TokenizerTrainer:
         start_epoch: int = 0,
     ) -> None:
         try:
+            if (
+                self.early_stopping_patience > 0
+                and self.epochs_without_improvement >= self.early_stopping_patience
+            ):
+                if self.context.is_main:
+                    print(
+                        "Resume checkpoint already satisfies early stopping; "
+                        "no additional epoch will be trained",
+                        flush=True,
+                    )
+                return
             for epoch in range(start_epoch, epochs):
                 self._configure_trainable_parameters(epoch)
                 sampler = getattr(train_loader, "sampler", None)
@@ -235,16 +276,17 @@ class TokenizerTrainer:
                 self.writer.flush()
                 self.writer.close()
 
-    def _autocast(self) -> Any:
-        dtype = torch.bfloat16 if self.precision == "bf16" else torch.float16
-        enabled = self.precision != "fp32" and self.context.device.type == "cuda"
+    def _autocast(self, precision: str | None = None) -> Any:
+        selected = self.precision if precision is None else precision
+        dtype = torch.bfloat16 if selected == "bf16" else torch.float16
+        enabled = selected != "fp32" and self.context.device.type == "cuda"
         return torch.autocast(self.context.device.type, dtype=dtype, enabled=enabled)
 
     def _configure_trainable_parameters(self, epoch: int) -> None:
-        freeze_base = epoch < self.freeze_base_epochs
+        freeze_base = self.freeze_base or epoch < self.freeze_base_epochs
         for name, parameter in self.model.named_parameters():
             initially_trainable = self._initial_requires_grad[name]
-            is_residual = "register_residual_" in name
+            is_residual = is_visual_residual_parameter(name)
             parameter.requires_grad_(
                 initially_trainable and (not freeze_base or is_residual)
             )
@@ -254,6 +296,42 @@ class TokenizerTrainer:
                 state = "frozen" if freeze_base else "trainable"
                 print(f"Base tokenizer parameters are now {state} at epoch {epoch}", flush=True)
 
+    @staticmethod
+    def _model_inputs(batch: dict[str, Any]) -> dict[str, Tensor]:
+        inputs = {
+            "frame_times": batch["frame_times"],
+            "future_times": batch["future_times"],
+        }
+        if "camera_hidden" in batch:
+            inputs["camera_hidden"] = batch["camera_hidden"]
+            inputs["register_hidden_mean"] = batch["register_hidden_mean"]
+            if "register_hidden" in batch:
+                inputs["register_hidden"] = batch["register_hidden"]
+            if "pose_enc" in batch:
+                inputs["pose_enc"] = batch["pose_enc"]
+        else:
+            inputs["images"] = batch["images"]
+        return inputs
+
+    def _shuffled_output(
+        self,
+        batch: dict[str, Any],
+        model_inputs: dict[str, Tensor],
+    ) -> Any | None:
+        if self.loss_module.config.conditional_shuffle_weight <= 0:
+            return None
+        batch_size = int(batch["trajectory"].shape[0])
+        if batch_size < 2:
+            return None
+        if "register_hidden" not in model_inputs or "pose_enc" not in model_inputs:
+            raise ValueError(
+                "Conditional shuffle loss requires cached full registers and pose_enc"
+            )
+        shuffled = dict(model_inputs)
+        shuffled["register_hidden"] = model_inputs["register_hidden"].roll(1, dims=0)
+        shuffled["pose_enc"] = model_inputs["pose_enc"].roll(1, dims=0)
+        return self.model(**shuffled)
+
     def _train_epoch(self, loader: Any, epoch: int, log_every: int) -> None:
         self.model.train()
         if self._base_frozen:
@@ -262,33 +340,24 @@ class TokenizerTrainer:
             self.model.eval()
             unwrapped = _unwrap(self.model)
             tokenizer = getattr(unwrapped, "tokenizer", unwrapped)
-            encoder = tokenizer.encoder
-            encoder.register_residual_projection.train()
-            encoder.register_residual_fusion.train()
-            encoder.register_residual_output.train()
+            for name, module in tokenizer.named_modules():
+                if "residual" in name:
+                    module.train()
         running: dict[str, float] = defaultdict(float)
         for batch_index, raw_batch in enumerate(loader):
             batch = _to_device(raw_batch, self.context.device)
             self.optimizer.zero_grad(set_to_none=True)
             with self._autocast():
-                model_inputs = {
-                    "frame_times": batch["frame_times"],
-                    "future_times": batch["future_times"],
-                }
-                if "camera_hidden" in batch:
-                    model_inputs["camera_hidden"] = batch["camera_hidden"]
-                    model_inputs["register_hidden_mean"] = batch["register_hidden_mean"]
-                    if "register_hidden" in batch:
-                        model_inputs["register_hidden"] = batch["register_hidden"]
-                else:
-                    model_inputs["images"] = batch["images"]
+                model_inputs = self._model_inputs(batch)
                 output = self.model(**model_inputs)
+                shuffled_output = self._shuffled_output(batch, model_inputs)
                 loss, terms = self.loss_module(
                     output,
                     batch["trajectory"],
                     batch["future_times"],
                     batch["trajectory_mask"],
                     self.global_step,
+                    shuffled_output=shuffled_output,
                 )
                 terms.update(_model_diagnostics(self.model))
             if not torch.isfinite(loss):
@@ -325,7 +394,7 @@ class TokenizerTrainer:
     def evaluate(self, loader: Any, epoch: int | None = None) -> dict[str, Tensor]:
         self.model.eval()
         totals: dict[str, Tensor] = {}
-        batches = 0
+        sample_count = 0
         visualization_count = 0
         visualized_scenes: set[str] = set()
         render_visualizations = (
@@ -335,25 +404,17 @@ class TokenizerTrainer:
         )
         for raw_batch in loader:
             batch = _to_device(raw_batch, self.context.device)
-            with self._autocast():
-                model_inputs = {
-                    "frame_times": batch["frame_times"],
-                    "future_times": batch["future_times"],
-                }
-                if "camera_hidden" in batch:
-                    model_inputs["camera_hidden"] = batch["camera_hidden"]
-                    model_inputs["register_hidden_mean"] = batch["register_hidden_mean"]
-                    if "register_hidden" in batch:
-                        model_inputs["register_hidden"] = batch["register_hidden"]
-                else:
-                    model_inputs["images"] = batch["images"]
+            with self._autocast(self.validation_precision):
+                model_inputs = self._model_inputs(batch)
                 output = self.model(**model_inputs)
+                shuffled_output = self._shuffled_output(batch, model_inputs)
                 _, terms = self.loss_module(
                     output,
                     batch["trajectory"],
                     batch["future_times"],
                     batch["trajectory_mask"],
                     self.global_step,
+                    shuffled_output=shuffled_output,
                 )
                 terms.update(_model_diagnostics(self.model))
                 terms.update(
@@ -406,13 +467,30 @@ class TokenizerTrainer:
                     )
                     visualized_scenes.add(scene_token)
                     visualization_count += 1
+            batch_size = int(batch["trajectory"].shape[0])
             for key, value in terms.items():
-                totals[key] = totals.get(key, torch.zeros_like(value)) + value
-            batches += 1
-        if batches == 0:
-            raise ValueError("Validation loader is empty")
-        averaged = {key: value / batches for key, value in totals.items()}
-        return reduce_metrics(averaged, self.context.world_size)
+                weighted = value.detach().float() * batch_size
+                totals[key] = totals.get(key, torch.zeros_like(weighted)) + weighted
+            sample_count += batch_size
+        return _reduce_sample_weighted_metrics(
+            totals, sample_count, self.context.world_size
+        )
+
+    def establish_initial_baseline(self, loader: Any) -> dict[str, Tensor]:
+        """Measure a warm start with the current precision and aggregation contract."""
+        metrics = self.evaluate(loader, epoch=-1)
+        ade = float(metrics.get("metric/ade_m", torch.tensor(math.inf)))
+        if not math.isfinite(ade):
+            raise ValueError("Initial validation ADE is not finite")
+        self.best_ade = ade
+        self.best_trained_ade = math.inf
+        self.epochs_without_improvement = 0
+        if self.context.is_main:
+            self._print_metrics("val initial", metrics)
+            self._write_scalars("validation", metrics, self.global_step)
+            if self.writer is not None:
+                self.writer.add_scalar("progress/epoch", -1, self.global_step)
+        return metrics
 
     def save_checkpoint(self, filename: str, epoch: int) -> None:
         """Atomically save enough state for a strict training resume."""
@@ -475,6 +553,7 @@ class TokenizerTrainer:
         self,
         path: str | Path,
         allowed_missing_prefixes: tuple[str, ...] = (),
+        inherit_best_metric: bool = True,
     ) -> None:
         """Warm-start model weights without importing optimizer or training state."""
         checkpoint = torch.load(path, map_location=self.context.device, weights_only=False)
@@ -491,7 +570,7 @@ class TokenizerTrainer:
                 "Initial checkpoint model mismatch: "
                 f"missing={invalid_missing}, unexpected={incompatible.unexpected_keys}"
             )
-        if "best_ade" in checkpoint:
+        if inherit_best_metric and "best_ade" in checkpoint:
             self.best_ade = float(checkpoint["best_ade"])
         if self.context.is_main:
             print(

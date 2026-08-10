@@ -86,17 +86,20 @@ def main() -> None:
                     if "register_hidden" in batch
                     else None
                 )
+                pose_enc = batch["pose_enc"].to(device).float()
             else:
                 features = extractor(batch["images"].to(device))
                 camera = features.camera_hidden
                 registers = features.register_hidden_mean
                 register_hidden = features.register_hidden
+                pose_enc = features.pose_enc
             output = tokenizer(
                 camera,
                 registers,
                 batch["frame_times"].to(device),
                 batch["future_times"].to(device),
                 register_hidden=register_hidden,
+                pose_enc=pose_enc,
             )
             latents.append(output.action_tokens.float().cpu())
             sample_tokens.extend(batch["sample_token"])
@@ -111,10 +114,23 @@ def main() -> None:
             "normalizer_std": normalizer.std.contiguous(),
         },
         args.output,
-        metadata={"checkpoint": str(args.checkpoint), "target": "vggt_interval_action_tokens"},
+        metadata={
+            "checkpoint": str(args.checkpoint),
+            "target": "vggt_interval_action_tokens",
+            "num_action_tokens": str(all_latents.shape[1]),
+            "action_token_dim": str(all_latents.shape[2]),
+        },
     )
     args.output.with_suffix(".json").write_text(
-        json.dumps({"sample_tokens": sample_tokens}, ensure_ascii=False), encoding="utf-8"
+        json.dumps(
+            {
+                "sample_tokens": sample_tokens,
+                "latent_shape": list(all_latents.shape),
+                "action_token_dim": int(all_latents.shape[2]),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
     )
 
 

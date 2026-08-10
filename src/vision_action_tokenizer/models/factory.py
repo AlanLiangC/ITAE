@@ -36,10 +36,18 @@ def build_tokenizer(config: dict[str, Any]) -> VisionActionTokenizer:
         raise ValueError(
             "num_action_tokens * steps_per_token must match horizon * trajectory_hz"
         )
+    output_action_dim = int(action["action_token_dim"])
+    motion_action_dim = int(action.get("motion_action_token_dim", output_action_dim))
+    visual_residual_dim = int(action.get("visual_residual_token_dim", 0))
+    if output_action_dim != motion_action_dim + visual_residual_dim:
+        raise ValueError(
+            "action_token_dim must equal motion_action_token_dim + "
+            "visual_residual_token_dim"
+        )
     return VisionActionTokenizer(
         vggt_feature_dim=int(backbone.get("feature_dim", 2048)),
         frame_geometry_dim=int(action["frame_geometry_dim"]),
-        action_token_dim=int(action["action_token_dim"]),
+        action_token_dim=motion_action_dim,
         num_action_tokens=num_tokens,
         steps_per_token=int(action["steps_per_token"]),
         decoder_hidden_dim=int(action["decoder_hidden_dim"]),
@@ -64,6 +72,20 @@ def build_tokenizer(config: dict[str, Any]) -> VisionActionTokenizer:
         max_forward_speed_mps=float(action.get("max_forward_speed_mps", 40.0)),
         max_lateral_speed_mps=float(action.get("max_lateral_speed_mps", 8.0)),
         max_yaw_rate_rps=float(action.get("max_yaw_rate_rps", 1.5)),
+        visual_residual_token_dim=visual_residual_dim,
+        visual_residual_frame_dim=int(action.get("visual_residual_frame_dim", 128)),
+        visual_residual_register_dim=int(
+            action.get("visual_residual_register_dim", 32)
+        ),
+        visual_residual_max_forward_mps=float(
+            action.get("visual_residual_max_forward_mps", 5.0)
+        ),
+        visual_residual_max_lateral_mps=float(
+            action.get("visual_residual_max_lateral_mps", 2.0)
+        ),
+        visual_residual_max_yaw_rate_rps=float(
+            action.get("visual_residual_max_yaw_rate_rps", 0.5)
+        ),
     )
 
 

@@ -78,6 +78,11 @@ def trajectory_metrics(
         "metric/increment_xy_mae_m": increment_xy_mae,
         "metric/increment_yaw_mae_rad": increment_yaw_mae,
     }
+    for interval_index, point_index in enumerate(keyframe_indices.tolist(), start=1):
+        interval_valid = valid[:, point_index]
+        metrics[f"metric/keyframe_{interval_index}s_ade_m"] = (
+            position_error[:, point_index] * interval_valid
+        ).sum() / interval_valid.sum().clamp_min(1)
     for key in ("speed", "acceleration", "jerk", "yaw_rate"):
         error = (predicted_dynamics[key] - target_dynamics[key]).abs()
         metrics[f"metric/{key}_mae"] = (error * valid).sum() / valid.sum().clamp_min(1)

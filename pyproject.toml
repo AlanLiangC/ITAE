@@ -21,6 +21,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "ruff>=0.6"]
 viz = ["matplotlib>=3.8"]
+pe = ["timm==1.0.15"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

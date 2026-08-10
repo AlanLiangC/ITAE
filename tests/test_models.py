@@ -6,11 +6,17 @@ import torch
 from tools.interpolate_tokenizer_checkpoints import interpolate_model_states
 from vision_action_tokenizer.losses import LossConfig, TokenizerLoss, trajectory_xy_loss
 from vision_action_tokenizer.models.decoder import (
+    ResidualVelocityDecoder,
     SE2IncrementDecoder,
     integrate_se2_increments,
     trajectory_to_body_increments,
 )
-from vision_action_tokenizer.models.tokenizer import IntervalActionEncoder, VisionActionTokenizer
+from vision_action_tokenizer.models.tokenizer import (
+    IntervalActionEncoder,
+    VisionActionTokenizer,
+    pose_motion_features,
+)
+from vision_action_tokenizer.trainer import _reduce_sample_weighted_metrics
 
 
 def test_se2_increment_round_trip() -> None:
@@ -209,6 +215,153 @@ def test_zero_output_residual_is_exact_but_receives_immediate_gradient() -> None
     assert isinstance(output, torch.nn.Linear)
     assert output.weight.grad is not None
     assert torch.count_nonzero(output.weight.grad) > 0
+
+
+def test_output_side_visual_residual_preserves_motion_and_decode_contract() -> None:
+    torch.manual_seed(11)
+    common = {
+        "vggt_feature_dim": 32,
+        "frame_geometry_dim": 16,
+        "action_token_dim": 8,
+        "num_action_tokens": 4,
+        "steps_per_token": 10,
+        "decoder_hidden_dim": 32,
+        "decoder_parameterization": "velocity",
+        "register_pooling": "mean",
+        "register_token_count": 4,
+    }
+    motion = VisionActionTokenizer(**common).eval()
+    residual = VisionActionTokenizer(
+        **common,
+        visual_residual_token_dim=4,
+        visual_residual_frame_dim=8,
+        visual_residual_register_dim=4,
+    ).eval()
+    incompatible = residual.load_state_dict(motion.state_dict(), strict=False)
+    assert not incompatible.unexpected_keys
+    assert all(key.startswith("visual_residual_") for key in incompatible.missing_keys)
+
+    camera = torch.randn(3, 5, 32)
+    register_mean = torch.randn(3, 5, 32)
+    registers = torch.randn(3, 5, 4, 32)
+    pose = torch.randn(3, 5, 9)
+    pose[..., 3:7] = torch.nn.functional.normalize(pose[..., 3:7], dim=-1)
+    frame_times = torch.arange(5).float().repeat(3, 1)
+    future_times = torch.arange(1, 41).float().repeat(3, 1) / 10
+    motion_output = motion(camera, register_mean, frame_times, future_times)
+    residual_output = residual(
+        camera,
+        register_mean,
+        frame_times,
+        future_times,
+        register_hidden=registers,
+        pose_enc=pose,
+    )
+    assert torch.equal(motion_output.reconstruction, residual_output.reconstruction)
+    assert residual_output.action_tokens.shape == (3, 4, 12)
+    assert residual_output.visual_residual_tokens is not None
+    assert torch.count_nonzero(residual_output.visual_residual_tokens) == 0
+    assert torch.equal(
+        residual.decode(residual_output.action_tokens, future_times),
+        residual_output.reconstruction,
+    )
+
+    target = torch.randn_like(residual_output.reconstruction)
+    loss = (residual_output.reconstruction - target).square().mean()
+    loss.backward()
+    assert residual.visual_residual_encoder is not None
+    assert residual.visual_residual_encoder.output.weight.grad is not None
+    assert torch.count_nonzero(
+        residual.visual_residual_encoder.output.weight.grad
+    ) > 0
+
+
+def test_visual_residual_losses_measure_condition_dependence() -> None:
+    torch.manual_seed(13)
+    tokenizer = VisionActionTokenizer(
+        vggt_feature_dim=16,
+        frame_geometry_dim=8,
+        action_token_dim=8,
+        num_action_tokens=4,
+        steps_per_token=10,
+        decoder_hidden_dim=16,
+        decoder_parameterization="velocity",
+        register_pooling="mean",
+        register_token_count=4,
+        visual_residual_token_dim=4,
+        visual_residual_frame_dim=8,
+        visual_residual_register_dim=4,
+    )
+    assert tokenizer.visual_residual_encoder is not None
+    with torch.no_grad():
+        tokenizer.visual_residual_encoder.output.weight.normal_(std=0.02)
+    camera = torch.randn(4, 5, 16)
+    register_mean = torch.randn(4, 5, 16)
+    registers = torch.randn(4, 5, 4, 16)
+    pose = torch.randn(4, 5, 9)
+    pose[..., 3:7] = torch.nn.functional.normalize(pose[..., 3:7], dim=-1)
+    frame_times = torch.arange(5).float().repeat(4, 1)
+    future_times = torch.arange(1, 41).float().repeat(4, 1) / 10
+    output = tokenizer(
+        camera,
+        register_mean,
+        frame_times,
+        future_times,
+        register_hidden=registers,
+        pose_enc=pose,
+    )
+    shuffled = tokenizer(
+        camera,
+        register_mean,
+        frame_times,
+        future_times,
+        register_hidden=registers.roll(1, dims=0),
+        pose_enc=pose.roll(1, dims=0),
+    )
+    target = torch.randn_like(output.reconstruction) * torch.tensor([1.0, 0.2, 0.1])
+    loss, terms = TokenizerLoss(
+        LossConfig(
+            residual_velocity_weight=0.25,
+            residual_yaw_rate_weight=0.02,
+            residual_mean_weight=0.01,
+            residual_alignment_weight=0.01,
+            conditional_shuffle_weight=0.1,
+            conditional_shuffle_margin=0.01,
+        )
+    )(
+        output,
+        target,
+        future_times,
+        torch.ones(4, 40, dtype=torch.bool),
+        global_step=10,
+        shuffled_output=shuffled,
+    )
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert "loss/residual_velocity" in terms
+    assert "loss/residual_alignment" in terms
+    assert "condition/shuffle_error_gap" in terms
+    assert tokenizer.visual_residual_encoder.output.weight.grad is not None
+
+
+def test_pose_motion_features_and_residual_decoder_contract() -> None:
+    pose = torch.zeros(2, 5, 9)
+    pose[..., 6] = 1.0
+    pose[:, :, 2] = torch.arange(5).float()
+    features = pose_motion_features(pose)
+    assert features.shape == (2, 5, 13)
+    assert torch.isfinite(features).all()
+
+    decoder = ResidualVelocityDecoder(token_dim=4, steps_per_token=10)
+    tokens = torch.zeros(2, 4, 4)
+    future_times = torch.arange(1, 41).float().repeat(2, 1) / 10
+    assert torch.count_nonzero(decoder(tokens, future_times)) == 0
+
+
+def test_sample_weighted_validation_metrics() -> None:
+    totals = {"metric/ade_m": torch.tensor(2 * 1.0 + 1 * 3.0)}
+    averaged = _reduce_sample_weighted_metrics(totals, sample_count=3, world_size=1)
+    assert averaged["metric/ade_m"].item() == pytest.approx(5 / 3)
 
 
 def test_checkpoint_interpolation_is_strict() -> None:

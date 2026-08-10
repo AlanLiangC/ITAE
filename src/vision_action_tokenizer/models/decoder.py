@@ -154,3 +154,57 @@ class SE2IncrementDecoder(nn.Module):
             )
         increments = increments.reshape(batch, expected_steps, 3)
         return integrate_se2_increments(increments), increments
+
+
+class ResidualVelocityDecoder(nn.Module):
+    """Decode compact visual tokens into bounded body-rate corrections.
+
+    The projection deliberately has no bias. A zero visual token therefore produces
+    an exactly zero correction, while the random projection supplies an immediate
+    gradient to a zero-initialized visual-token output layer.
+    """
+
+    def __init__(
+        self,
+        token_dim: int,
+        steps_per_token: int = 10,
+        max_forward_correction_mps: float = 5.0,
+        max_lateral_correction_mps: float = 2.0,
+        max_yaw_rate_correction_rps: float = 0.5,
+    ) -> None:
+        super().__init__()
+        if token_dim <= 0 or steps_per_token <= 0:
+            raise ValueError("Residual token dimensions must be positive")
+        limits = torch.tensor(
+            [
+                max_forward_correction_mps,
+                max_lateral_correction_mps,
+                max_yaw_rate_correction_rps,
+            ],
+            dtype=torch.float32,
+        )
+        if torch.any(limits <= 0):
+            raise ValueError("Residual velocity and yaw-rate limits must be positive")
+        self.steps_per_token = steps_per_token
+        self.register_buffer("limits", limits, persistent=True)
+        self.output = nn.Linear(token_dim, steps_per_token * 3, bias=False)
+        nn.init.normal_(self.output.weight, std=0.02)
+
+    def forward(self, tokens: Tensor, future_times: Tensor) -> Tensor:
+        if tokens.ndim != 3 or future_times.ndim != 2:
+            raise ValueError("Expected residual tokens [B,K,D] and future_times [B,T]")
+        batch, intervals, _ = tokens.shape
+        expected_steps = intervals * self.steps_per_token
+        if future_times.shape != (batch, expected_steps):
+            raise ValueError(
+                f"Expected {expected_steps} future times for {intervals} residual tokens, "
+                f"got {tuple(future_times.shape)}"
+            )
+        zero = torch.zeros_like(future_times[:, :1])
+        delta_t = torch.diff(torch.cat([zero, future_times], dim=1), dim=1)
+        if torch.any(delta_t <= 0):
+            raise ValueError("future_times must be strictly increasing and positive")
+        raw_rates = self.output(tokens).reshape(batch, expected_steps, 3)
+        limits = self.limits.to(dtype=raw_rates.dtype).view(1, 1, 3)
+        rates = limits * torch.tanh(raw_rates / limits)
+        return rates * delta_t.unsqueeze(-1)

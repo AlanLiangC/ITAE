@@ -216,6 +216,35 @@ python tools/interpolate_tokenizer_checkpoints.py \
 
 `resume: auto` 始终优先 `last.pt`，因此同目录的 soup/evaluation checkpoint 不会干扰续训。
 
+V3.1 的 full-register adapter 最终约 `99.8%` 激活能量是跨样本共享偏置，register shuffle
+不会令 ADE 恶化。下一轮推荐使用 V4 output residual：motion encoder/decoder 全程冻结，新增
+64-D 视觉残差 token，并直接解码为 10 Hz body velocity/yaw-rate correction。最终导出的 action
+token 为 `128-D motion + 64-D residual = 192-D`，仍可仅靠 token 和时间调用 `decode()`。
+
+```bash
+torchrun --standalone --nproc_per_node=1 \
+  tools/train_tokenizer.py \
+  --config configs/nuscenes_vggt_omega_front_4s_v4_output_residual.yaml \
+  --train-manifest data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
+  --val-manifest data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl \
+  --output output/itae_vggt_omega_v4_output_residual
+```
+
+V4 会在训练开始前用新的 sample-weighted FP32 validation 重新测量 motion 基线，避免 BF16
+误差改变 checkpoint 排名。TensorBoard 额外
+记录 residual rate/token、trajectory-residual contrastive alignment，以及正常条件相对 shuffled
+register+pose 的 error gap。训练后用同一 evaluator 自动完成冻结 motion、单独打乱 register、
+单独打乱 pose 和同时错配两者的消融：
+
+```bash
+python tools/evaluate_tokenizer.py \
+  --config configs/nuscenes_vggt_omega_front_4s_v4_output_residual.yaml \
+  --manifest data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl \
+  --checkpoint output/itae_vggt_omega_v4_output_residual/best_trained.pt \
+  --output output/itae_vggt_omega_v4_output_residual/val_metrics.json \
+  --residual-ablation
+```
+
 ## 4. 评估与 action latent 导出
 
 ```bash
@@ -240,6 +269,23 @@ python tools/export_action_latents.py \
 
 导出的 latent shape 为 `[N,4,128]`，并包含训练 action expert 所需的 mean/std。decoder 只读取
 action tokens 与 query 时间，不读取图像、VGGT hidden 或 GT。
+
+## 5. PE Flow Planner：raw trajectory vs V4 action token
+
+新增公平的 flow-matching planner 对照：两条分支只输入当前一张 `CAM_FRONT`，共用冻结
+`PE-Spatial-B16-512` 的 `8×8` patch-grid condition 和同一个 9.4M Transformer core。raw 分支
+预测 `[40,3]`，token 分支预测 `[4,192]` 后由冻结 V4 decoder 重建；推理严格为 5-step Euler、
+`NFE=5`。
+
+配置：
+
+- `configs/planner/nuscenes_flow_raw_pe_4s.yaml`；
+- `configs/planner/nuscenes_flow_token_v4_pe_4s.yaml`。
+
+数据切分、PE/action-target cache、三 seed 训练、TensorBoard、final evaluation、paired bootstrap
+和汇总命令见
+[`docs/FLOW_PLANNER_EXPERIMENT_GUIDE.md`](docs/FLOW_PLANNER_EXPERIMENT_GUIDE.md)。设计和公平性约束见
+[`docs/FLOW_PLANNER_RAW_VS_TOKEN_CODE_PLAN.md`](docs/FLOW_PLANNER_RAW_VS_TOKEN_CODE_PLAN.md)。
 
 ## 验证状态
 

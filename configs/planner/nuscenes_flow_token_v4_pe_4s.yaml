@@ -1,0 +1,73 @@
+seed: 42
+
+data:
+  num_workers: 4
+
+vision_condition:
+  type: pe_spatial
+  mode: cached
+  model_name: PE-Spatial-B16-512
+  source_path: third_party/perception_models
+  checkpoint_path: /home/alan/AlanLiang/Projects/pure_checkpoints/PE-Spatial-B16-512/PE-Spatial-B16-512.pt
+  checkpoint_sha256: 86217607f0bb28c0adb5ac3f9b0608ae22f6fb634bf1c16b2316847e8148a2a5
+  freeze: true
+  image_size: 512
+  resize_mode: squash
+  layer_idx: -1
+  strip_cls_token: true
+  pool_grid: [8, 8]
+  cache_dtype: float16
+  cache:
+    train: /home/alan/AlanLiang/Dataset/itae_planner_cache/pe_spatial_b16_512/train
+    validation: /home/alan/AlanLiang/Dataset/itae_planner_cache/pe_spatial_b16_512/validation
+    final_eval: /home/alan/AlanLiang/Dataset/itae_planner_cache/pe_spatial_b16_512/final_eval
+
+action_targets:
+  teacher:
+    config: configs/nuscenes_vggt_omega_front_4s_v4_output_residual.yaml
+    checkpoint: output/itae_vggt_omega_v4_output_residual/best.pt
+    checkpoint_sha256: 78f11556263e56830a1604dada548a30643133c03bd3673ab695cb4c63d2f9a0
+  cache:
+    train: /home/alan/AlanLiang/Dataset/itae_planner_cache/v4_action_targets/train.safetensors
+    validation: /home/alan/AlanLiang/Dataset/itae_planner_cache/v4_action_targets/validation.safetensors
+    final_eval: /home/alan/AlanLiang/Dataset/itae_planner_cache/v4_action_targets/final_eval.safetensors
+
+planner:
+  target: v4_action_token
+  target_shape: [4, 192]
+  normalizer_epsilon: 0.0001
+  model:
+    dim: 256
+    layers: 8
+    heads: 8
+    mlp_ratio: 4
+    dropout: 0.1
+
+train:
+  resume: auto
+  max_steps: 50000
+  batch_size: 64
+  learning_rate: 0.0002
+  betas: [0.9, 0.95]
+  weight_decay: 0.01
+  warmup_steps: 1000
+  min_lr_ratio: 0.05
+  grad_clip_norm: 1.0
+  precision: bf16
+  ema_decay: 0.999
+  log_every: 20
+  eval_every_steps: 500
+  save_every_steps: 500
+
+evaluation:
+  batch_size: 64
+  inference_steps: 5
+  expected_nfe: 5
+  noise_seed: 12345
+  max_validation_batches: null
+
+tensorboard:
+  enabled: true
+  flush_secs: 30
+  evaluation_visualization_items: 8
+  evaluation_visualization_every_steps: 2500

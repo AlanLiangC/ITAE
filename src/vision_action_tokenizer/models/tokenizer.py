@@ -9,7 +9,7 @@ import torch
 from torch import Tensor, nn
 
 from .common import sinusoidal_time_embedding
-from .decoder import SE2IncrementDecoder
+from .decoder import ResidualVelocityDecoder, SE2IncrementDecoder, integrate_se2_increments
 
 
 @dataclass
@@ -19,6 +19,156 @@ class TokenizerOutput:
     action_tokens: Tensor
     reconstruction: Tensor
     predicted_increments: Tensor
+    base_action_tokens: Tensor | None = None
+    visual_residual_tokens: Tensor | None = None
+    base_reconstruction: Tensor | None = None
+    base_increments: Tensor | None = None
+    residual_increments: Tensor | None = None
+
+
+def _quaternion_to_matrix(quaternion: Tensor) -> Tensor:
+    """Convert scalar-last XYZW quaternions to rotation matrices."""
+    if quaternion.shape[-1] != 4:
+        raise ValueError("Quaternion must have four scalar-last components")
+    i, j, k, real = quaternion.unbind(dim=-1)
+    scale = 2.0 / quaternion.square().sum(dim=-1).clamp_min(1e-8)
+    matrix = torch.stack(
+        [
+            1 - scale * (j * j + k * k),
+            scale * (i * j - k * real),
+            scale * (i * k + j * real),
+            scale * (i * j + k * real),
+            1 - scale * (i * i + k * k),
+            scale * (j * k - i * real),
+            scale * (i * k - j * real),
+            scale * (j * k + i * real),
+            1 - scale * (i * i + j * j),
+        ],
+        dim=-1,
+    )
+    return matrix.reshape(*quaternion.shape[:-1], 3, 3)
+
+
+def pose_motion_features(pose_enc: Tensor) -> Tensor:
+    """Build scale-aware and scale-invariant motion cues from VGGT 9D poses.
+
+    VGGT extrinsics are camera-from-world. Camera centers are expressed in the first
+    camera coordinate system, then augmented with unit translation direction,
+    log-distance and the first two columns of relative rotation. This exposes the
+    reliable direction/rotation signal without pretending monocular translation is
+    already metric.
+    """
+    if pose_enc.ndim != 3 or pose_enc.shape[-1] != 9:
+        raise ValueError(f"Expected pose_enc [B,F,9], got {tuple(pose_enc.shape)}")
+    translation = pose_enc[..., :3].float()
+    rotation = _quaternion_to_matrix(pose_enc[..., 3:7].float())
+    centers = -(rotation.transpose(-1, -2) @ translation.unsqueeze(-1)).squeeze(-1)
+    relative_world = centers - centers[:, :1]
+    anchor_rotation = rotation[:, :1]
+    relative_center = (
+        anchor_rotation @ relative_world.unsqueeze(-1)
+    ).squeeze(-1)
+    distance = torch.linalg.vector_norm(relative_center, dim=-1, keepdim=True)
+    direction = relative_center / distance.clamp_min(1e-4)
+    relative_rotation = rotation @ anchor_rotation.transpose(-1, -2)
+    rotation_6d = relative_rotation[..., :, :2].reshape(*pose_enc.shape[:2], 6)
+    return torch.cat(
+        [relative_center, direction, torch.log1p(distance), rotation_6d], dim=-1
+    )
+
+
+class VisualMotionResidualEncoder(nn.Module):
+    """Encode full registers and pretrained camera motion into correction tokens."""
+
+    pose_feature_dim = 13
+
+    def __init__(
+        self,
+        input_dim: int,
+        register_token_count: int,
+        register_projection_dim: int,
+        frame_dim: int,
+        token_dim: int,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if min(
+            input_dim,
+            register_token_count,
+            register_projection_dim,
+            frame_dim,
+            token_dim,
+        ) <= 0:
+            raise ValueError("Visual residual dimensions must be positive")
+        self.register_token_count = register_token_count
+        self.frame_dim = frame_dim
+        self.register_projection = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, register_projection_dim, bias=False),
+            nn.GELU(),
+        )
+        self.register_fusion = nn.Sequential(
+            nn.LayerNorm(register_token_count * register_projection_dim),
+            nn.Linear(register_token_count * register_projection_dim, frame_dim),
+            nn.GELU(),
+        )
+        self.pose_projection = nn.Sequential(
+            nn.LayerNorm(self.pose_feature_dim),
+            nn.Linear(self.pose_feature_dim, frame_dim),
+            nn.GELU(),
+        )
+        self.frame_fusion = nn.Sequential(
+            nn.LayerNorm(frame_dim * 2),
+            nn.Linear(frame_dim * 2, frame_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.interval_fusion = nn.Sequential(
+            nn.LayerNorm(frame_dim * 4),
+            nn.Linear(frame_dim * 4, frame_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(frame_dim * 2, frame_dim),
+            nn.GELU(),
+        )
+        self.output = nn.Linear(frame_dim, token_dim, bias=False)
+        nn.init.zeros_(self.output.weight)
+
+    def forward(
+        self,
+        register_hidden: Tensor,
+        pose_enc: Tensor,
+        frame_times: Tensor,
+    ) -> Tensor:
+        if register_hidden.ndim != 4:
+            raise ValueError("Visual residual requires register_hidden [B,F,R,C]")
+        if register_hidden.shape[2] != self.register_token_count:
+            raise ValueError(
+                "Visual residual register count mismatch: "
+                f"{register_hidden.shape[2]} != {self.register_token_count}"
+            )
+        if pose_enc.shape[:2] != register_hidden.shape[:2]:
+            raise ValueError("pose_enc must align with register_hidden frames")
+        if frame_times.shape != register_hidden.shape[:2]:
+            raise ValueError("frame_times must align with visual residual frames")
+        delta_t = torch.diff(frame_times, dim=1)
+        if torch.any(delta_t <= 0):
+            raise ValueError("frame_times must be strictly increasing")
+
+        # Center within each frame so the V2 mean-register path remains the sole
+        # owner of the common feature; the new branch receives slot structure.
+        registers = register_hidden.float()
+        centered = registers - registers.mean(dim=2, keepdim=True)
+        register_frame = self.register_projection(centered).flatten(2)
+        register_frame = self.register_fusion(register_frame)
+        pose_frame = self.pose_projection(pose_motion_features(pose_enc))
+        frame = self.frame_fusion(torch.cat([register_frame, pose_frame], dim=-1))
+        left, right = frame[:, :-1], frame[:, 1:]
+        time = sinusoidal_time_embedding(delta_t, self.frame_dim)
+        interval = self.interval_fusion(
+            torch.cat([left, right, right - left, time], dim=-1)
+        )
+        return self.output(interval)
 
 
 class IntervalActionEncoder(nn.Module):
@@ -262,10 +412,18 @@ class VisionActionTokenizer(nn.Module):
         max_forward_speed_mps: float = 40.0,
         max_lateral_speed_mps: float = 8.0,
         max_yaw_rate_rps: float = 1.5,
+        visual_residual_token_dim: int = 0,
+        visual_residual_frame_dim: int = 128,
+        visual_residual_register_dim: int = 32,
+        visual_residual_max_forward_mps: float = 5.0,
+        visual_residual_max_lateral_mps: float = 2.0,
+        visual_residual_max_yaw_rate_rps: float = 0.5,
     ) -> None:
         super().__init__()
         self.num_action_tokens = num_action_tokens
         self.steps_per_token = steps_per_token
+        self.base_action_token_dim = action_token_dim
+        self.visual_residual_token_dim = visual_residual_token_dim
         self.encoder = IntervalActionEncoder(
             input_dim=vggt_feature_dim,
             frame_geometry_dim=frame_geometry_dim,
@@ -293,6 +451,32 @@ class VisionActionTokenizer(nn.Module):
             max_lateral_speed_mps=max_lateral_speed_mps,
             max_yaw_rate_rps=max_yaw_rate_rps,
         )
+        self.visual_residual_encoder: VisualMotionResidualEncoder | None = None
+        self.visual_residual_decoder: ResidualVelocityDecoder | None = None
+        if visual_residual_token_dim:
+            if register_pooling != "mean":
+                raise ValueError(
+                    "Output-side visual residual requires the checkpoint-compatible mean path"
+                )
+            self.visual_residual_encoder = VisualMotionResidualEncoder(
+                input_dim=vggt_feature_dim,
+                register_token_count=register_token_count,
+                register_projection_dim=visual_residual_register_dim,
+                frame_dim=visual_residual_frame_dim,
+                token_dim=visual_residual_token_dim,
+                dropout=dropout,
+            )
+            self.visual_residual_decoder = ResidualVelocityDecoder(
+                token_dim=visual_residual_token_dim,
+                steps_per_token=steps_per_token,
+                max_forward_correction_mps=visual_residual_max_forward_mps,
+                max_lateral_correction_mps=visual_residual_max_lateral_mps,
+                max_yaw_rate_correction_rps=visual_residual_max_yaw_rate_rps,
+            )
+
+    @property
+    def output_action_token_dim(self) -> int:
+        return self.base_action_token_dim + self.visual_residual_token_dim
 
     def forward(
         self,
@@ -301,25 +485,69 @@ class VisionActionTokenizer(nn.Module):
         frame_times: Tensor,
         future_times: Tensor,
         register_hidden: Tensor | None = None,
+        pose_enc: Tensor | None = None,
+        disable_visual_residual: bool = False,
     ) -> TokenizerOutput:
         if camera_hidden.shape[1] - 1 != self.num_action_tokens:
             raise ValueError(
                 f"Expected {self.num_action_tokens + 1} frames, got {camera_hidden.shape[1]}"
             )
-        action_tokens = self.encoder(
+        base_action_tokens = self.encoder(
             camera_hidden,
             register_hidden_mean,
             frame_times,
             register_hidden=register_hidden,
         )
-        reconstruction, increments = self.decoder(action_tokens, future_times)
+        base_reconstruction, base_increments = self.decoder(
+            base_action_tokens, future_times
+        )
+        if self.visual_residual_encoder is None:
+            return TokenizerOutput(
+                action_tokens=base_action_tokens,
+                reconstruction=base_reconstruction,
+                predicted_increments=base_increments,
+            )
+        if register_hidden is None or pose_enc is None:
+            raise ValueError(
+                "Output-side visual residual requires full register_hidden and pose_enc"
+            )
+        visual_tokens = self.visual_residual_encoder(
+            register_hidden, pose_enc, frame_times
+        )
+        if disable_visual_residual:
+            visual_tokens = torch.zeros_like(visual_tokens)
+        assert self.visual_residual_decoder is not None
+        residual_increments = self.visual_residual_decoder(
+            visual_tokens, future_times
+        )
+        increments = base_increments + residual_increments
+        reconstruction = integrate_se2_increments(increments)
+        action_tokens = torch.cat([base_action_tokens, visual_tokens], dim=-1)
         return TokenizerOutput(
             action_tokens=action_tokens,
             reconstruction=reconstruction,
             predicted_increments=increments,
+            base_action_tokens=base_action_tokens,
+            visual_residual_tokens=visual_tokens,
+            base_reconstruction=base_reconstruction,
+            base_increments=base_increments,
+            residual_increments=residual_increments,
         )
 
     def decode(self, action_tokens: Tensor, future_times: Tensor) -> Tensor:
         """Decode `[B,4,D]` action tokens without any visual context."""
-        reconstruction, _ = self.decoder(action_tokens, future_times)
-        return reconstruction
+        if self.visual_residual_decoder is None:
+            reconstruction, _ = self.decoder(action_tokens, future_times)
+            return reconstruction
+        if action_tokens.shape[-1] != self.output_action_token_dim:
+            raise ValueError(
+                "Expected concatenated motion/residual action dimension "
+                f"{self.output_action_token_dim}, got {action_tokens.shape[-1]}"
+            )
+        base_tokens = action_tokens[..., : self.base_action_token_dim]
+        visual_tokens = action_tokens[..., self.base_action_token_dim :]
+        _, base_increments = self.decoder(base_tokens, future_times)
+        residual_increments = self.visual_residual_decoder(
+            visual_tokens, future_times
+        )
+        return integrate_se2_increments(base_increments + residual_increments)

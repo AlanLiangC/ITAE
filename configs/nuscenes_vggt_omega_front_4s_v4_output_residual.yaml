@@ -1,0 +1,123 @@
+seed: 42
+
+data:
+  data_root: data/nuscenes
+  image_source: keyframe
+  frame_offsets_s: [0.0, 1.0, 2.0, 3.0, 4.0]
+  max_image_time_error_s: 0.25
+  trajectory_pose_source: lidar_sweeps
+  trajectory_sampling: nearest
+  future_horizon_s: 4.0
+  trajectory_hz: 10
+  max_trajectory_time_error_s: 0.03
+  max_pose_interpolation_gap_s: 0.15
+  anchor_stride_s: 0.0
+  feature_cache:
+    train: /home/alan/AlanLiang/Dataset/vggt_omega_cache/nuscenes_front_4s_train_rich
+    val: /home/alan/AlanLiang/Dataset/vggt_omega_cache/nuscenes_front_4s_val_rich
+  num_workers: 4
+
+vision_backbone:
+  type: vggt_omega
+  source_path: third_party/vggt-omega
+  checkpoint_path: /home/alan/AlanLiang/Projects/pure_checkpoints/VGGT-Omega/vggt_omega_1b_512.pt
+  checkpoint_sha256: c02da418b18bb01d0392598d3f6147366bcde1bb70fd08a5e3bf7925b0667934
+  feature_dim: 2048
+  image_resolution: 512
+  resize_mode: max_size
+  patch_size: 16
+  freeze_aggregator: true
+  freeze_camera_trunk: true
+  cache_token_mode: camera_register_tokens
+  cache_dtype: float16
+
+action_tokenizer:
+  num_frames: 5
+  num_action_tokens: 4
+  # The exported token is 128-D frozen motion + 64-D visual residual = 192-D.
+  action_token_dim: 192
+  motion_action_token_dim: 128
+  visual_residual_token_dim: 64
+  visual_residual_frame_dim: 128
+  visual_residual_register_dim: 32
+  visual_residual_max_forward_mps: 5.0
+  visual_residual_max_lateral_mps: 2.0
+  visual_residual_max_yaw_rate_rps: 0.5
+  frame_geometry_dim: 256
+  steps_per_token: 10
+  decoder_hidden_dim: 256
+  decoder_type: se2_increment
+  decoder_parameterization: velocity
+  initial_forward_speed_mps: 5.0
+  max_forward_speed_mps: 40.0
+  max_lateral_speed_mps: 8.0
+  max_yaw_rate_rps: 1.5
+  interval_mixer_layers: 2
+  interval_mixer_heads: 4
+  register_pooling: mean
+  register_token_count: 16
+  dropout: 0.0
+
+loss:
+  trajectory_weight: 1.0
+  increment_weight: 0.25
+  keyframe_weight: 0.75
+  yaw_weight: 0.1
+  body_velocity_weight: 0.1
+  yaw_rate_weight: 0.02
+  acceleration_weight: 0.002
+  jerk_weight: 0.00002
+  boundary_continuity_weight: 0.01
+  # Directly supervise GT body rates minus the frozen motion prediction.
+  residual_velocity_weight: 0.25
+  residual_yaw_rate_weight: 0.02
+  # Suppress the sample-independent correction observed in V3.1.
+  residual_mean_weight: 0.01
+  # Align each visual correction pattern with its own trajectory residual.
+  residual_alignment_weight: 0.002
+  residual_alignment_temperature: 0.1
+  residual_alignment_warmup_steps: 3000
+  # A mismatched register/pose pair must fit worse than the true pair.
+  conditional_shuffle_weight: 0.1
+  conditional_shuffle_margin: 0.01
+  conditional_shuffle_warmup_steps: 500
+
+train:
+  resume: auto
+  initial_checkpoint: output/itae_vggt_omega_v2_motion/best.pt
+  evaluate_initial_checkpoint: true
+  epochs: 120
+  batch_size: 32
+  learning_rate: 0.00005
+  freeze_base: true
+  weight_decay: 0.01
+  warmup_steps: 500
+  grad_clip_norm: 5.0
+  precision: bf16
+  # Checkpoint selection must agree with the standalone FP32 evaluator.
+  validation_precision: fp32
+  log_every: 20
+  early_stopping_patience: 20
+  early_stopping_min_delta: 0.0001
+  motion_balancing:
+    enabled: true
+    bucket_weights:
+      stationary: 0.5
+      straight_slow: 1.0
+      straight_fast: 1.25
+      turn: 1.5
+    speed_trend_threshold_mps: 0.5
+    speed_trend_weights:
+      stationary: 1.0
+      steady: 1.0
+      accelerating: 1.0
+      decelerating: 1.0
+
+tensorboard:
+  enabled: true
+  log_dir: null
+  flush_secs: 30
+  evaluation_visualization_items: 8
+  evaluation_visualization_every_epochs: 5
+  evaluation_visualization_include_images: true
+  evaluation_visualization_distinct_scenes: true

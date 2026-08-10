@@ -143,6 +143,46 @@
             }
         },
         {
+            "name": "ITAE VGGT V4: Train output residual",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/alan/miniconda3/envs/py312torch210cu126/bin/python",
+            "program": "${workspaceFolder}/tools/train_tokenizer.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": [
+                "--config", "${workspaceFolder}/configs/nuscenes_vggt_omega_front_4s_v4_output_residual.yaml",
+                "--train-manifest", "${workspaceFolder}/data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl",
+                "--val-manifest", "${workspaceFolder}/data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl",
+                "--output", "${workspaceFolder}/output/itae_vggt_omega_v4_output_residual"
+            ],
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+            }
+        },
+        {
+            "name": "ITAE VGGT V4: Evaluate + ablation",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/alan/miniconda3/envs/py312torch210cu126/bin/python",
+            "program": "${workspaceFolder}/tools/evaluate_tokenizer.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": [
+                "--config", "${workspaceFolder}/configs/nuscenes_vggt_omega_front_4s_v4_output_residual.yaml",
+                "--manifest", "${workspaceFolder}/data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl",
+                "--checkpoint", "${workspaceFolder}/output/itae_vggt_omega_v4_output_residual/best_trained.pt",
+                "--output", "${workspaceFolder}/output/itae_vggt_omega_v4_output_residual/val_metrics.json",
+                "--residual-ablation"
+            ],
+            "env": {
+                "PYTHONUNBUFFERED": "1"
+            }
+        },
+        {
             "name": "ITAE VGGT: Evaluate tokenizer",
             "type": "debugpy",
             "request": "launch",
@@ -158,6 +198,89 @@
                 "--pose-calibration", "${workspaceFolder}/output/vggt_camera_motion_audit/train/camera_motion_calibration.json",
                 "--checkpoint", "${workspaceFolder}/output/itae_vggt_omega_v1/best.pt",
                 "--output", "${workspaceFolder}/output/itae_vggt_omega_v1/val_metrics.json"
+            ],
+            "env": {
+                "PYTHONUNBUFFERED": "1"
+            }
+        },
+        {
+            "name": "ITAE Planner: Cache PE train",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/alan/miniconda3/envs/py312torch210cu126/bin/python",
+            "program": "${workspaceFolder}/tools/cache_planner_vision_features.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "--config", "${workspaceFolder}/configs/planner/nuscenes_flow_raw_pe_4s.yaml",
+                "--manifest", "${workspaceFolder}/data/manifests/nuscenes_planner_front_4s/planner_train.jsonl",
+                "--output", "/home/alan/AlanLiang/Dataset/itae_planner_cache/pe_spatial_b16_512/train",
+                "--batch-size", "8",
+                "--shard-size", "256",
+                "--num-workers", "4"
+            ],
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+            }
+        },
+        {
+            "name": "ITAE Planner: Train raw PE",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/alan/miniconda3/envs/py312torch210cu126/bin/python",
+            "program": "${workspaceFolder}/tools/train_flow_planner.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": [
+                "--config", "${workspaceFolder}/configs/planner/nuscenes_flow_raw_pe_4s.yaml",
+                "--train-manifest", "${workspaceFolder}/data/manifests/nuscenes_planner_front_4s/planner_train.jsonl",
+                "--val-manifest", "${workspaceFolder}/data/manifests/nuscenes_planner_front_4s/planner_validation.jsonl",
+                "--output", "${workspaceFolder}/output/planner_raw_pe_seed42",
+                "--seed", "42"
+            ],
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+            }
+        },
+        {
+            "name": "ITAE Planner: Train V4 token PE",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/alan/miniconda3/envs/py312torch210cu126/bin/python",
+            "program": "${workspaceFolder}/tools/train_flow_planner.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": [
+                "--config", "${workspaceFolder}/configs/planner/nuscenes_flow_token_v4_pe_4s.yaml",
+                "--train-manifest", "${workspaceFolder}/data/manifests/nuscenes_planner_front_4s/planner_train.jsonl",
+                "--val-manifest", "${workspaceFolder}/data/manifests/nuscenes_planner_front_4s/planner_validation.jsonl",
+                "--output", "${workspaceFolder}/output/planner_token_v4_pe_seed42",
+                "--seed", "42"
+            ],
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+            }
+        },
+        {
+            "name": "ITAE Planner: Evaluate raw PE",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/alan/miniconda3/envs/py312torch210cu126/bin/python",
+            "program": "${workspaceFolder}/tools/evaluate_flow_planner.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": [
+                "--config", "${workspaceFolder}/configs/planner/nuscenes_flow_raw_pe_4s.yaml",
+                "--manifest", "${workspaceFolder}/data/manifests/nuscenes_planner_front_4s/planner_final_eval.jsonl",
+                "--checkpoint", "${workspaceFolder}/output/planner_raw_pe_seed42/best.pt",
+                "--output", "${workspaceFolder}/output/planner_eval/raw_seed42"
             ],
             "env": {
                 "PYTHONUNBUFFERED": "1"

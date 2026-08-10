@@ -416,6 +416,125 @@ def render_evaluation_diagnostic(
     return torch.from_numpy(array).permute(2, 0, 1).contiguous()
 
 
+def render_planner_diagnostic(
+    current_image: Tensor | np.ndarray,
+    target: Tensor | np.ndarray,
+    prediction: Tensor | np.ndarray,
+    future_times: Tensor | np.ndarray,
+    sample_token: str = "",
+    width: int = 1200,
+    height: int = 800,
+) -> Tensor:
+    """Render current RGB, GT, prediction and their BEV overlay in a 2x2 page."""
+    image = _camera_frame_to_image(current_image)
+    target_np = _to_numpy(target)
+    prediction_np = _to_numpy(prediction)
+    times = _to_numpy(future_times).reshape(-1)
+    if target_np.shape != prediction_np.shape or target_np.shape != (len(times), 3):
+        raise ValueError("Planner visualization expects aligned [T,3] trajectories")
+
+    scale = 2
+    canvas = Image.new("RGB", (width * scale, height * scale), (15, 18, 24))
+    draw = ImageDraw.Draw(canvas)
+    try:
+        title_font = ImageFont.truetype("DejaVuSans.ttf", 16 * scale)
+        small_font = ImageFont.truetype("DejaVuSans.ttf", 11 * scale)
+    except OSError:
+        title_font = ImageFont.load_default(size=16 * scale)
+        small_font = ImageFont.load_default(size=11 * scale)
+    margin = 18 * scale
+    gap = 14 * scale
+    header = 42 * scale
+    panel_w = (width * scale - 2 * margin - gap) / 2
+    panel_h = (height * scale - header - margin - gap) / 2
+    panels = [
+        (margin, header),
+        (margin + panel_w + gap, header),
+        (margin, header + panel_h + gap),
+        (margin + panel_w + gap, header + panel_h + gap),
+    ]
+    draw.text(
+        (margin, 10 * scale),
+        f"Flow planner evaluation | sample=...{sample_token[-16:]}",
+        fill=(235, 238, 245),
+        font=title_font,
+    )
+    for left, top in panels:
+        draw.rounded_rectangle(
+            (left, top, left + panel_w, top + panel_h),
+            radius=10 * scale,
+            fill=(27, 32, 42),
+            outline=(67, 76, 92),
+            width=2,
+        )
+
+    camera = ImageOps.contain(
+        image, (round(panel_w - 24 * scale), round(panel_h - 46 * scale))
+    )
+    camera_left = round(panels[0][0] + (panel_w - camera.width) / 2)
+    camera_top = round(panels[0][1] + 34 * scale)
+    canvas.paste(camera, (camera_left, camera_top))
+    draw.text(
+        (panels[0][0] + 12 * scale, panels[0][1] + 8 * scale),
+        "Current CAM_FRONT (only planner input)",
+        fill=(235, 238, 245),
+        font=small_font,
+    )
+
+    all_xy = np.vstack([np.zeros((1, 2)), target_np[:, :2], prediction_np[:, :2]])
+    x_min, y_min = all_xy.min(axis=0)
+    x_max, y_max = all_xy.max(axis=0)
+    x_span = max(float(x_max - x_min), 10.0)
+    y_span = max(float(y_max - y_min), 10.0)
+    x_center, y_center = 0.5 * (x_min + x_max), 0.5 * (y_min + y_max)
+    x_min, x_max = x_center - 0.6 * x_span, x_center + 0.6 * x_span
+    y_min, y_max = y_center - 0.6 * y_span, y_center + 0.6 * y_span
+
+    def project(xy: np.ndarray, panel: tuple[float, float]) -> list[tuple[float, float]]:
+        left, top = panel
+        plot_left, plot_right = left + 28 * scale, left + panel_w - 20 * scale
+        plot_top, plot_bottom = top + 38 * scale, top + panel_h - 20 * scale
+        u = plot_left + (y_max - xy[:, 1]) / (y_max - y_min) * (plot_right - plot_left)
+        v = plot_top + (x_max - xy[:, 0]) / (x_max - x_min) * (plot_bottom - plot_top)
+        return list(zip(u.astype(float), v.astype(float), strict=True))
+
+    entries = [
+        ("Ground truth", target_np, False),
+        ("5-NFE prediction", prediction_np, False),
+        ("Overlay: dashed GT + colored prediction", prediction_np, True),
+    ]
+    origin_np = np.zeros((1, 2), dtype=np.float32)
+    for panel, (title, trajectory, overlay) in zip(panels[1:], entries, strict=True):
+        draw.text(
+            (panel[0] + 12 * scale, panel[1] + 8 * scale),
+            title,
+            fill=(235, 238, 245),
+            font=small_font,
+        )
+        origin = project(origin_np, panel)[0]
+        draw.line(
+            (panel[0] + 18 * scale, origin[1], panel[0] + panel_w - 18 * scale, origin[1]),
+            fill=(65, 72, 84),
+        )
+        if overlay:
+            _draw_dashed_path(
+                draw, [origin, *project(target_np[:, :2], panel)], (205, 210, 220)
+            )
+        _draw_time_colored_path(
+            draw, [origin, *project(trajectory[:, :2], panel)]
+        )
+    fde = float(np.linalg.norm(prediction_np[-1, :2] - target_np[-1, :2]))
+    draw.text(
+        (panels[3][0] + 12 * scale, panels[3][1] + panel_h - 18 * scale),
+        f"FDE={fde:.2f}m | green -> yellow -> red",
+        fill=(205, 210, 220),
+        font=small_font,
+    )
+    canvas = canvas.resize((width, height), Image.Resampling.LANCZOS)
+    array = np.asarray(canvas, dtype=np.float32) / 255.0
+    return torch.from_numpy(array).permute(2, 0, 1).contiguous()
+
+
 def render_vggt_evaluation_diagnostic(
     target: Tensor | np.ndarray,
     reconstruction: Tensor | np.ndarray,

@@ -148,6 +148,7 @@ class OnlineOmegaTrainingModel(nn.Module):
             camera_hidden=features.camera_hidden,
             register_hidden_mean=features.register_hidden_mean,
             register_hidden=features.register_hidden,
+            pose_enc=features.pose_enc,
             frame_times=frame_times,
             future_times=future_times,
         )
@@ -167,12 +168,14 @@ class CachedOmegaTrainingModel(nn.Module):
         frame_times: Tensor,
         future_times: Tensor,
         register_hidden: Tensor | None = None,
+        pose_enc: Tensor | None = None,
         **_: Any,
     ) -> Any:
         return self.tokenizer(
             camera_hidden=camera_hidden,
             register_hidden_mean=register_hidden_mean,
             register_hidden=register_hidden,
+            pose_enc=pose_enc,
             frame_times=frame_times,
             future_times=future_times,
         )

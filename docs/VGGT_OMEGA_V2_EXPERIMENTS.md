@@ -161,3 +161,53 @@ python tools/interpolate_tokenizer_checkpoints.py \
 该工具严格检查 state key、shape、dtype 和非浮点 buffer；输出只用于 evaluation/export，不能
 作为完整 optimizer resume checkpoint。不要在 val 上搜索大量 alpha 后再把同一 val 当作无偏
 结果；`0.5` 应作为事先固定的诊断候选。
+
+## V3.1 结果与 V4 output residual
+
+V3.1 `best_trained.pt` 的全量 ADE/FDE 为 `0.3271/0.6315 m`，motion 初始化为
+`0.3275/0.6364 m`，仅有轻微改善。其 adapter 激活的样本相关能量占比只有 `0.19%`；打乱
+centered register 后 ADE 从 `0.327121` 变为 `0.327086 m`，说明改善来自通用速度偏置，而非
+视觉条件。解冻主干后的 last ADE 又退化至 `0.3306 m`。
+
+V4 针对该失败模式改变表示和监督位置：
+
+```text
+motion_token[128] = frozen V2 mean-register encoder
+base_increments    = frozen V2 decoder(motion_token)
+
+residual_token[64] = zero-output(
+    full centered registers + relative VGGT pose direction/rotation
+)
+residual_increments = bounded 10 Hz rate decoder(residual_token)
+
+action_token       = concat(motion_token, residual_token)  # 192-D
+reconstruction     = integrate(base_increments + residual_increments)
+```
+
+- motion encoder/decoder 全程冻结，避免后期破坏已验证的 `0.3275 m` 基线；
+- residual token 的最后一层零初始化且无 bias，初始化重建与 motion 逐位相同；
+- 显式监督 `GT body rates - frozen motion body rates`；
+- batch-mean residual penalty 抑制跨样本共享偏置；
+- interval residual pattern 与 GT residual 使用对称 contrastive alignment；
+- 同一个 batch 内循环错配 full-register 与 pose，ranking loss 要求错配条件误差更高；
+- `pose_enc` 只提供相对 camera center、单位平移方向、log-distance 和 relative rotation 6D，
+  不假设单目 pose translation 已经是米制；
+- validation 改为 sample-weighted FP32 聚合，使 checkpoint 排名与独立 evaluator 一致；恢复已
+  满足 patience 的 checkpoint 不再多训练一轮。
+
+固定 8 个真实 cache 样本的 300-step 可学习性测试中，正常条件 ADE 从 `0.1297` 降至
+`0.0136 m`，错配 register+pose 后为 `0.1723 m`，证明新路径能记住样本相关修正。该结果只是
+梯度/条件性验收，不代表 val 泛化结果。
+
+```bash
+torchrun --standalone --nproc_per_node=1 tools/train_tokenizer.py \
+  --config configs/nuscenes_vggt_omega_front_4s_v4_output_residual.yaml \
+  --train-manifest data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
+  --val-manifest data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl \
+  --output output/itae_vggt_omega_v4_output_residual
+```
+
+验收不只看 ADE/FDE，还必须同时满足：`normal < base_motion < shuffled_condition`，并分别检查
+`shuffled_register` 与 `shuffled_pose` 来判断信息来源；同时要求
+TensorBoard 的 `condition/shuffle_error_gap` 为正、`condition/prediction_l2_m` 明显非零。若
+ADE 改善但 shuffle 不退化，仍视为视觉条件失败，不继续加参数量。

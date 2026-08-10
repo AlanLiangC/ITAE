@@ -102,6 +102,11 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--tensorboard-dir", type=Path)
     parser.add_argument("--visualize-items", type=int)
+    parser.add_argument(
+        "--residual-ablation",
+        action="store_true",
+        help="Also evaluate frozen motion and shuffled visual conditions",
+    )
     args = parser.parse_args()
     config = load_config(args.config)
     backbone = config["vision_backbone"]
@@ -151,6 +156,8 @@ def main() -> None:
     tokenizer = build_tokenizer(config).to(device).eval()
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     tokenizer.load_state_dict(tokenizer_state_from_checkpoint(checkpoint), strict=True)
+    if args.residual_ablation and tokenizer.visual_residual_encoder is None:
+        raise ValueError("--residual-ablation requires a visual residual tokenizer")
     extractor = (
         None
         if cache is not None
@@ -183,6 +190,11 @@ def main() -> None:
     stationary_totals: dict[str, float] = defaultdict(float)
     mean_totals: dict[str, float] = defaultdict(float)
     pose_totals: dict[str, float] = defaultdict(float)
+    base_motion_totals: dict[str, float] = defaultdict(float)
+    shuffled_register_totals: dict[str, float] = defaultdict(float)
+    shuffled_pose_totals: dict[str, float] = defaultdict(float)
+    shuffled_condition_totals: dict[str, float] = defaultdict(float)
+    shuffled_prediction_l2: dict[str, float] = defaultdict(float)
     bucket_totals: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
     bucket_counts: dict[str, int] = defaultdict(int)
     sample_count = 0
@@ -218,7 +230,37 @@ def main() -> None:
                     batch["frame_times"].to(device),
                     times,
                     register_hidden=register_hidden,
+                    pose_enc=pose_enc,
                 )
+                shuffled_register_output = None
+                shuffled_pose_output = None
+                shuffled_output = None
+                if args.residual_ablation:
+                    assert register_hidden is not None
+                    shuffled_register_output = tokenizer(
+                        camera_hidden,
+                        registers,
+                        batch["frame_times"].to(device),
+                        times,
+                        register_hidden=register_hidden.roll(1, dims=0),
+                        pose_enc=pose_enc,
+                    )
+                    shuffled_pose_output = tokenizer(
+                        camera_hidden,
+                        registers,
+                        batch["frame_times"].to(device),
+                        times,
+                        register_hidden=register_hidden,
+                        pose_enc=pose_enc.roll(1, dims=0),
+                    )
+                    shuffled_output = tokenizer(
+                        camera_hidden,
+                        registers,
+                        batch["frame_times"].to(device),
+                        times,
+                        register_hidden=register_hidden.roll(1, dims=0),
+                        pose_enc=pose_enc.roll(1, dims=0),
+                    )
                 pose_prediction = (
                     None
                     if pose_scale is None
@@ -248,6 +290,45 @@ def main() -> None:
                         steps_per_token=steps_per_token,
                     )
                     _accumulate(model_totals, model_metrics)
+                    if args.residual_ablation:
+                        assert output.base_reconstruction is not None
+                        assert shuffled_register_output is not None
+                        assert shuffled_pose_output is not None
+                        assert shuffled_output is not None
+                        base_motion_metrics = trajectory_metrics(
+                            output.base_reconstruction[selection],
+                            *metric_args,
+                            steps_per_token=steps_per_token,
+                        )
+                        _accumulate(base_motion_totals, base_motion_metrics)
+                        variants = {
+                            "shuffled_register": (
+                                shuffled_register_output,
+                                shuffled_register_totals,
+                            ),
+                            "shuffled_pose": (
+                                shuffled_pose_output,
+                                shuffled_pose_totals,
+                            ),
+                            "shuffled_condition": (
+                                shuffled_output,
+                                shuffled_condition_totals,
+                            ),
+                        }
+                        for name, (variant, destination) in variants.items():
+                            metrics = trajectory_metrics(
+                                variant.reconstruction[selection],
+                                *metric_args,
+                                steps_per_token=steps_per_token,
+                            )
+                            _accumulate(destination, metrics)
+                            shuffled_prediction_l2[name] += float(
+                                torch.linalg.vector_norm(
+                                    output.reconstruction[item_index, :, :2]
+                                    - variant.reconstruction[item_index, :, :2],
+                                    dim=-1,
+                                ).mean()
+                            )
                     _accumulate(stationary_totals, stationary_metrics)
                     bucket = _motion_bucket(trajectory[item_index])
                     _accumulate(bucket_totals[bucket], model_metrics)
@@ -337,6 +418,21 @@ def main() -> None:
         baselines["train_mean"] = averaged(mean_totals, sample_count)
     if pose_scale is not None:
         baselines["vggt_pose_train_calibrated"] = averaged(pose_totals, sample_count)
+    if args.residual_ablation:
+        report["residual_ablation"] = {
+            "base_motion": averaged(base_motion_totals, sample_count),
+            "shuffled_register": averaged(
+                shuffled_register_totals, sample_count
+            ),
+            "shuffled_pose": averaged(shuffled_pose_totals, sample_count),
+            "shuffled_condition": averaged(
+                shuffled_condition_totals, sample_count
+            ),
+            "normal_vs_shuffled_prediction_l2_m": {
+                name: value / sample_count
+                for name, value in sorted(shuffled_prediction_l2.items())
+            },
+        }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2), encoding="utf-8")
     if writer is not None:
@@ -344,6 +440,27 @@ def main() -> None:
         assert isinstance(model_report, dict)
         for key, value in model_report.items():
             writer.add_scalar(f"evaluation/{key}", value, step)
+        if args.residual_ablation:
+            ablation_report = report["residual_ablation"]
+            assert isinstance(ablation_report, dict)
+            for variant in (
+                "base_motion",
+                "shuffled_register",
+                "shuffled_pose",
+                "shuffled_condition",
+            ):
+                metrics = ablation_report[variant]
+                assert isinstance(metrics, dict)
+                for key, value in metrics.items():
+                    writer.add_scalar(
+                        f"evaluation_ablation/{variant}/{key}", value, step
+                    )
+            effects = ablation_report["normal_vs_shuffled_prediction_l2_m"]
+            assert isinstance(effects, dict)
+            for variant, value in effects.items():
+                writer.add_scalar(
+                    f"evaluation_ablation/prediction_l2_m/{variant}", value, step
+                )
         writer.close()
     print(json.dumps(report, indent=2))
 

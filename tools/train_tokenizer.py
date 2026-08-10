@@ -26,7 +26,10 @@ from vision_action_tokenizer.data.manifest import WindowRecord, load_manifest, m
 from vision_action_tokenizer.distributed import cleanup_distributed, initialize_distributed
 from vision_action_tokenizer.losses import LossConfig, TokenizerLoss
 from vision_action_tokenizer.models.factory import build_training_model
-from vision_action_tokenizer.trainer import TokenizerTrainer
+from vision_action_tokenizer.trainer import (
+    TokenizerTrainer,
+    is_visual_residual_parameter,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -293,7 +296,17 @@ def main() -> None:
     cached = train_cached
     if not cached and int(config["train"]["batch_size"]) != 1:
         raise ValueError("Online VGGT-Omega training requires train.batch_size=1 on this GPU")
-    model = build_training_model(config, cached=cached).to(context.device)
+    model = build_training_model(config, cached=cached)
+    if bool(config["train"].get("freeze_base", False)):
+        residual_count = 0
+        for name, parameter in model.named_parameters():
+            residual = is_visual_residual_parameter(name)
+            parameter.requires_grad_(residual)
+            residual_count += parameter.numel() if residual else 0
+        if residual_count == 0:
+            raise ValueError("train.freeze_base requires visual residual parameters")
+        print(f"Permanently froze motion path; residual parameters={residual_count:,}")
+    model = model.to(context.device)
     if context.world_size > 1:
         model = DistributedDataParallel(
             model,
@@ -316,13 +329,21 @@ def main() -> None:
     residual_parameters = [
         parameter
         for name, parameter in named_parameters
-        if "register_residual_" in name
+        if is_visual_residual_parameter(name)
     ]
     residual_parameter_ids = {id(parameter) for parameter in residual_parameters}
     base_parameters = [
         parameter for parameter in parameters if id(parameter) not in residual_parameter_ids
     ]
-    if residual_parameters and base_learning_rate_scale != 1.0:
+    if residual_parameters and not base_parameters:
+        optimizer_groups = [
+            {
+                "params": residual_parameters,
+                "lr": learning_rate,
+                "name": "visual_residual",
+            }
+        ]
+    elif residual_parameters and base_learning_rate_scale != 1.0:
         optimizer_groups = [
             {
                 "params": base_parameters,
@@ -332,14 +353,14 @@ def main() -> None:
             {
                 "params": residual_parameters,
                 "lr": learning_rate,
-                "name": "register_residual",
+                "name": "visual_residual",
             },
         ]
         print(
             "Optimizer parameter groups: "
             f"base={sum(p.numel() for p in base_parameters):,} "
             f"lr={learning_rate * base_learning_rate_scale:g}; "
-            f"register_residual={sum(p.numel() for p in residual_parameters):,} "
+            f"visual_residual={sum(p.numel() for p in residual_parameters):,} "
             f"lr={learning_rate:g}",
             flush=True,
         )
@@ -381,10 +402,19 @@ def main() -> None:
         start_epoch = 0
         initial_checkpoint = config["train"].get("initial_checkpoint")
         if initial_checkpoint not in (None, ""):
+            evaluate_initial = bool(
+                config["train"].get("evaluate_initial_checkpoint", False)
+            )
             trainer.load_initial_weights(
                 initial_checkpoint,
-                allowed_missing_prefixes=("tokenizer.encoder.register_residual_",),
+                allowed_missing_prefixes=(
+                    "tokenizer.encoder.register_residual_",
+                    "tokenizer.visual_residual_",
+                ),
+                inherit_best_metric=not evaluate_initial,
             )
+            if evaluate_initial:
+                trainer.establish_initial_baseline(val_loader)
             if context.is_main:
                 trainer.save_checkpoint("initial.pt", epoch=-1)
                 trainer.save_checkpoint("best.pt", epoch=-1)
