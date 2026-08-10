@@ -65,3 +65,52 @@ def test_raw_and_token_planners_initialize_shared_core_identically() -> None:
     assert raw_shared.keys() == token_shared.keys()
     for key in raw_shared:
         torch.testing.assert_close(raw_shared[key], token_shared[key], rtol=0, atol=0)
+
+
+def test_flow_planner_accepts_per_condition_token_times() -> None:
+    model = ConditionalFlowPlanner(
+        target_dim=3,
+        target_slots=4,
+        condition_dim=16,
+        condition_tokens=12,
+        model_dim=32,
+        num_heads=4,
+        num_layers=1,
+        dropout=0.0,
+    )
+    output = model(
+        torch.randn(2, 4, 3),
+        torch.rand(2),
+        torch.randn(2, 12, 16),
+        torch.ones(2, 12, dtype=torch.bool),
+        torch.rand(2, 4),
+        torch.tensor([[-1.0] * 4 + [-0.5] * 4 + [0.0] * 4] * 2),
+    )
+    assert output.shape == (2, 4, 3)
+
+
+def test_flow_planner_accepts_ego_motion_state_tokens() -> None:
+    model = ConditionalFlowPlanner(
+        target_dim=3,
+        target_slots=4,
+        condition_dim=16,
+        condition_tokens=12,
+        model_dim=32,
+        num_heads=4,
+        num_layers=1,
+        dropout=0.0,
+        ego_motion_dim=6,
+        ego_motion_tokens=3,
+        ego_motion_scales=[40.0, 10.0, 3.14, 40.0, 10.0, 2.0],
+    )
+    output = model(
+        torch.randn(2, 4, 3),
+        torch.rand(2),
+        torch.randn(2, 12, 16),
+        torch.ones(2, 12, dtype=torch.bool),
+        torch.rand(2, 4),
+        torch.tensor([[-1.0] * 4 + [-0.5] * 4 + [0.0] * 4] * 2),
+        torch.randn(2, 3, 6),
+        torch.tensor([[-1.0, -0.5, 0.0]] * 2),
+    )
+    assert output.shape == (2, 4, 3)

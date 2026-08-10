@@ -287,6 +287,11 @@ action tokens 与 query 时间，不读取图像、VGGT hidden 或 GT。
 [`docs/FLOW_PLANNER_EXPERIMENT_GUIDE.md`](docs/FLOW_PLANNER_EXPERIMENT_GUIDE.md)。设计和公平性约束见
 [`docs/FLOW_PLANNER_RAW_VS_TOKEN_CODE_PLAN.md`](docs/FLOW_PLANNER_RAW_VS_TOKEN_CODE_PLAN.md)。
 
+planner 的 condition frame 现为显式 setting。新增 `[-1.0,-0.5,0.0]s` 的 2Hz 三帧实验，
+每个 PE patch token 带实际相对时间，并额外使用由历史 LiDAR poses 得到的
+`[x,y,yaw,vx,vy,yaw_rate]` ego-motion state tokens；完整流程见
+[`docs/FLOW_PLANNER_2HZ3F_EXPERIMENT_GUIDE.md`](docs/FLOW_PLANNER_2HZ3F_EXPERIMENT_GUIDE.md)。
+
 ## 验证状态
 
 - 官方 VGGT `max_size` 预处理逐像素一致；

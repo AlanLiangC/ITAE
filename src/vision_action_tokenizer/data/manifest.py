@@ -30,6 +30,8 @@ class WindowRecord:
     future_times_s: list[float]
     max_image_time_error_us: int
     max_trajectory_time_error_us: int
+    ego_motion_states: list[list[float]] | None = None
+    ego_motion_times_s: list[float] | None = None
 
 
 class ManifestBuilder:
@@ -49,6 +51,7 @@ class ManifestBuilder:
         image_source: str = "all",
         trajectory_pose_source: str = "frame_keyframes",
         trajectory_sampling: str = "interpolate",
+        export_ego_motion_condition: bool = False,
     ) -> None:
         if trajectory_hz <= 0 or horizon_s <= 0:
             raise ValueError("trajectory_hz and horizon_s must be positive")
@@ -89,6 +92,13 @@ class ManifestBuilder:
         self.image_source = image_source
         self.trajectory_pose_source = trajectory_pose_source
         self.trajectory_sampling = trajectory_sampling
+        self.export_ego_motion_condition = export_ego_motion_condition
+        if self.export_ego_motion_condition and len(self.frame_offsets_s) < 2:
+            raise ValueError("Ego-motion condition requires at least two condition frames")
+        if self.export_ego_motion_condition and any(
+            offset > 0 for offset in self.frame_offsets_s
+        ):
+            raise ValueError("Ego-motion condition cannot include future frame offsets")
 
     @classmethod
     def from_config(
@@ -109,6 +119,9 @@ class ManifestBuilder:
             image_source=str(data["image_source"]),
             trajectory_pose_source=str(data["trajectory_pose_source"]),
             trajectory_sampling=str(data["trajectory_sampling"]),
+            export_ego_motion_condition=bool(
+                config.get("ego_motion_condition", {}).get("enabled", False)
+            ),
         )
 
     def build(
@@ -133,6 +146,7 @@ class ManifestBuilder:
             "duplicate_trajectory_pose": 0,
             "anchor_lidar_mismatch": 0,
             "trajectory_interpolation_gap": 0,
+            "ego_motion_time_mismatch": 0,
         }
         image_errors: list[int] = []
         trajectory_errors: list[int] = []
@@ -235,6 +249,53 @@ class ManifestBuilder:
                     continue
 
                 matched_images = [match.value for match in image_matches if match is not None]
+                ego_motion_states = None
+                ego_motion_times_s = None
+                if self.export_ego_motion_condition:
+                    ego_samples = []
+                    for record in matched_images:
+                        sample = interpolate_pose_at_timestamp(
+                            record.cam_front_timestamp_us,
+                            pose_timestamps_us,
+                            poses,
+                            self.max_pose_interpolation_gap_us,
+                        )
+                        if sample is None:
+                            nearest = pose_index.nearest(
+                                record.cam_front_timestamp_us,
+                                self.max_trajectory_error_us,
+                            )
+                            sample = (
+                                None
+                                if nearest is None
+                                else (nearest.value.ego_to_global, nearest.error_us)
+                            )
+                        ego_samples.append(sample)
+                    if any(sample is None for sample in ego_samples):
+                        rejected["ego_motion_time_mismatch"] += 1
+                        continue
+                    valid_ego_samples = [
+                        sample for sample in ego_samples if sample is not None
+                    ]
+                    ego_motion_times_s = [
+                        (record.cam_front_timestamp_us - anchor_us) / 1_000_000.0
+                        for record in matched_images
+                    ]
+                    if any(
+                        right <= left
+                        for left, right in zip(
+                            ego_motion_times_s,
+                            ego_motion_times_s[1:],
+                            strict=False,
+                        )
+                    ):
+                        rejected["ego_motion_time_mismatch"] += 1
+                        continue
+                    ego_motion_states = self._ego_motion_states(
+                        anchor_pose,
+                        [sample[0] for sample in valid_ego_samples],
+                        ego_motion_times_s,
+                    ).tolist()
                 resolved_paths = [
                     self._resolve_image_path(record.cam_front_path) for record in matched_images
                 ]
@@ -274,6 +335,8 @@ class ManifestBuilder:
                         ),
                         max_image_time_error_us=max(current_image_errors),
                         max_trajectory_time_error_us=max(current_trajectory_errors),
+                        ego_motion_states=ego_motion_states,
+                        ego_motion_times_s=ego_motion_times_s,
                     )
                 )
 
@@ -299,6 +362,7 @@ class ManifestBuilder:
                 else 0
             ),
             "max_pose_interpolation_gap_us": self.max_pose_interpolation_gap_us,
+            "ego_motion_condition": self.export_ego_motion_condition,
         }
         return windows, report
 
@@ -359,6 +423,34 @@ class ManifestBuilder:
 
     def _resolve_image_path(self, path_value: str) -> str:
         return str(resolve_data_path(self.data_root, path_value))
+
+    @staticmethod
+    def _ego_motion_states(
+        anchor_pose: np.ndarray,
+        poses: list[np.ndarray],
+        times_s: list[float],
+    ) -> np.ndarray:
+        """Return causal pose/velocity states aligned to condition LiDAR poses."""
+        local = poses_to_local_trajectory(anchor_pose, poses).astype(np.float64)
+        if len(local) < 2 or len(local) != len(times_s):
+            raise ValueError("Ego-motion state requires at least two aligned poses")
+        segment_states: list[list[float]] = []
+        for index in range(1, len(local)):
+            dt = float(times_s[index] - times_s[index - 1])
+            if dt <= 0:
+                raise ValueError("Ego-motion timestamps must be strictly increasing")
+            delta_xy = local[index, :2] - local[index - 1, :2]
+            yaw = float(local[index - 1, 2])
+            cosine, sine = np.cos(yaw), np.sin(yaw)
+            body_x = cosine * delta_xy[0] + sine * delta_xy[1]
+            body_y = -sine * delta_xy[0] + cosine * delta_xy[1]
+            segment_states.append(
+                [body_x / dt, body_y / dt, (local[index, 2] - yaw) / dt]
+            )
+        velocities = np.asarray(
+            [segment_states[0], *segment_states], dtype=np.float64
+        )
+        return np.concatenate([local, velocities], axis=-1).astype(np.float32)
 
     @staticmethod
     def _trajectory_max(windows: list[WindowRecord]) -> float | None:

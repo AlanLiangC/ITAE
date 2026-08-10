@@ -75,6 +75,15 @@ def evaluate_planner(
             break
         condition = batch["condition_tokens"].to(device).float()
         condition_mask = batch["condition_mask"].to(device)
+        condition_times = batch.get("condition_times")
+        if condition_times is not None:
+            condition_times = condition_times.to(device).float()
+        ego_motion = batch.get("ego_motion")
+        ego_motion_times = batch.get("ego_motion_times")
+        if ego_motion is not None:
+            assert ego_motion_times is not None
+            ego_motion = ego_motion.to(device).float()
+            ego_motion_times = ego_motion_times.to(device).float()
         future_times = batch["future_times"].to(device).float()
         slot_times = planner_slot_times(
             decoder.target_type, future_times, target_shape[0]
@@ -85,6 +94,9 @@ def evaluate_planner(
             condition_mask,
             slot_times,
             target_shape,
+            condition_times=condition_times,
+            ego_motion=ego_motion,
+            ego_motion_times=ego_motion_times,
             steps=inference_steps,
             generator=generator,
             expected_nfe=expected_nfe,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cache configured current-frame planner vision features in verified shards."""
+"""Cache configurable single- or multi-frame planner vision features."""
 
 from __future__ import annotations
 
@@ -24,20 +24,92 @@ from vision_action_tokenizer.models.vision_backbones import (
 )
 
 
-class CurrentImageDataset(Dataset[dict[str, torch.Tensor | str]]):
-    def __init__(self, manifest: Path, transform: object, limit: int | None) -> None:
+class ConditionImageDataset(Dataset[dict[str, torch.Tensor | str]]):
+    def __init__(
+        self,
+        manifest: Path,
+        transform: object,
+        limit: int | None,
+        frame_indices: list[int],
+        expected_offsets_s: list[float],
+        max_frame_time_error_s: float,
+        causal_tolerance_s: float,
+        export_ego_motion: bool,
+    ) -> None:
         windows = load_manifest(manifest)
         self.windows = windows if limit is None else windows[:limit]
         self.transform = transform
+        self.frame_indices = frame_indices
+        self.expected_offsets_s = expected_offsets_s
+        self.max_frame_time_error_s = max_frame_time_error_s
+        self.causal_tolerance_s = causal_tolerance_s
+        self.export_ego_motion = export_ego_motion
+        if not frame_indices or len(frame_indices) != len(expected_offsets_s):
+            raise ValueError("frame_indices and frame_offsets_s must be non-empty and aligned")
+        if len(set(frame_indices)) != len(frame_indices):
+            raise ValueError("Planner condition frame_indices must be unique")
+        if any(
+            right <= left
+            for left, right in zip(
+                expected_offsets_s, expected_offsets_s[1:], strict=False
+            )
+        ):
+            raise ValueError("Planner condition frame_offsets_s must be strictly increasing")
+        if any(offset > 0 for offset in expected_offsets_s):
+            raise ValueError("Planner condition frames cannot request future timestamps")
 
     def __len__(self) -> int:
         return len(self.windows)
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
         window = self.windows[index]
-        with Image.open(window.image_paths[0]) as image:
-            tensor = self.transform(image)  # type: ignore[operator]
-        return {"image": tensor, "sample_token": window.sample_token}
+        images = []
+        actual_times = []
+        for frame_index, expected_time in zip(
+            self.frame_indices, self.expected_offsets_s, strict=True
+        ):
+            if not 0 <= frame_index < len(window.image_paths):
+                raise IndexError(
+                    f"Condition frame index {frame_index} is invalid for "
+                    f"sample {window.sample_token}"
+                )
+            actual_time = float(window.frame_times_s[frame_index])
+            if abs(actual_time - expected_time) > self.max_frame_time_error_s + 1e-9:
+                raise ValueError(
+                    f"Condition frame time mismatch for {window.sample_token}: "
+                    f"actual={actual_time:.3f}s expected={expected_time:.3f}s"
+                )
+            if actual_time > self.causal_tolerance_s + 1e-9:
+                raise ValueError(
+                    f"Condition frame leaks future data for {window.sample_token}: "
+                    f"t={actual_time:.3f}s"
+                )
+            with Image.open(window.image_paths[frame_index]) as image:
+                images.append(self.transform(image))  # type: ignore[operator]
+            actual_times.append(actual_time)
+        sample: dict[str, torch.Tensor | str] = {
+            "images": torch.stack(images),
+            "frame_times": torch.tensor(actual_times, dtype=torch.float32),
+            "sample_token": window.sample_token,
+        }
+        if self.export_ego_motion:
+            if window.ego_motion_states is None or window.ego_motion_times_s is None:
+                raise ValueError(
+                    f"Manifest sample {window.sample_token} has no ego-motion condition"
+                )
+            states = torch.tensor(window.ego_motion_states, dtype=torch.float32)
+            state_times = torch.tensor(window.ego_motion_times_s, dtype=torch.float32)
+            if states.shape != (len(self.frame_indices), 6):
+                raise ValueError("Ego-motion state must have shape [condition_frames,6]")
+            if state_times.shape != (len(self.frame_indices),):
+                raise ValueError("Ego-motion times must align with condition frames")
+            if not torch.isfinite(states).all() or not torch.isfinite(state_times).all():
+                raise ValueError("Ego-motion condition contains non-finite values")
+            if torch.any(state_times > self.causal_tolerance_s + 1e-6):
+                raise ValueError("Ego-motion condition leaks a future state")
+            sample["ego_motion_states"] = states
+            sample["ego_motion_times"] = state_times
+        return sample
 
 
 def _atomic_write(path: Path, value: dict[str, object]) -> None:
@@ -79,16 +151,58 @@ def main() -> None:
     vision_config = config["vision_condition"]
     if not bool(vision_config.get("freeze", True)):
         raise ValueError("Feature caching requires a frozen vision backbone")
+    explicit_frame_setting = "frame_indices" in vision_config
+    frame_indices = list(map(int, vision_config.get("frame_indices", [0])))
+    frame_offsets_s = list(
+        map(float, vision_config.get("frame_offsets_s", [0.0]))
+    )
+    max_frame_time_error_s = float(
+        vision_config.get("max_frame_time_error_s", 0.25)
+    )
+    causal_tolerance_s = float(vision_config.get("causal_tolerance_s", 0.25))
+    current_frame_index = int(vision_config.get("current_frame_index", frame_indices[-1]))
+    if current_frame_index not in frame_indices:
+        raise ValueError("current_frame_index must be one of vision_condition.frame_indices")
+    current_position = frame_indices.index(current_frame_index)
+    if abs(frame_offsets_s[current_position]) > max_frame_time_error_s:
+        raise ValueError("current_frame_index must select the condition frame at t=0")
+    ego_config = config.get("ego_motion_condition", {})
+    export_ego_motion = bool(ego_config.get("enabled", False))
+    ego_state_dim = int(ego_config.get("state_dim", 6))
+    ego_tokens = int(ego_config.get("num_tokens", len(frame_indices)))
+    if export_ego_motion and (ego_state_dim != 6 or ego_tokens != len(frame_indices)):
+        raise ValueError(
+            "Ego-motion export requires state_dim=6 and one token per condition frame"
+        )
     transform = build_planner_vision_transform(config)
-    dataset = CurrentImageDataset(args.manifest, transform, args.max_samples)
+    dataset = ConditionImageDataset(
+        args.manifest,
+        transform,
+        args.max_samples,
+        frame_indices,
+        frame_offsets_s,
+        max_frame_time_error_s,
+        causal_tolerance_s,
+        export_ego_motion,
+    )
     extractor = build_planner_vision_backbone(config).cuda().eval()
     backbone_metadata = extractor.preprocessing_metadata()
     feature_dtype = str(vision_config.get("cache_dtype", "float16"))
     if feature_dtype not in {"float16", "bfloat16", "float32"}:
         raise ValueError("vision_condition.cache_dtype is unsupported")
     output_dtype = getattr(torch, feature_dtype)
+    cache_type = (
+        "planner_vision_condition_v3"
+        if export_ego_motion
+        else (
+            "planner_vision_condition_v2"
+            if explicit_frame_setting
+            else "planner_vision_condition_v1"
+        )
+    )
+    tokens_per_frame = extractor.output_token_count
     metadata: dict[str, object] = {
-        "cache_type": "planner_vision_condition_v1",
+        "cache_type": cache_type,
         "manifest_sha256": file_sha256(args.manifest),
         "backbone_type": str(vision_config["type"]),
         "model_name": str(vision_config.get("model_name", vision_config["type"])),
@@ -96,11 +210,35 @@ def main() -> None:
         "source_commit": _git_commit(vision_config.get("source_path")),
         "preprocessing": backbone_metadata,
         "preprocessing_hash": stable_hash(backbone_metadata),
-        "condition_shape": [extractor.output_token_count, extractor.feature_dim],
+        "condition_shape": [
+            len(frame_indices) * tokens_per_frame,
+            extractor.feature_dim,
+        ],
         "condition_grid": backbone_metadata.get("pool_grid"),
         "feature_dtype": feature_dtype,
         "expected_num_samples": len(dataset),
     }
+    if cache_type in {"planner_vision_condition_v2", "planner_vision_condition_v3"}:
+        metadata.update(
+            {
+                "frame_indices": frame_indices,
+                "current_frame_index": current_frame_index,
+                "condition_frame_offsets_s": frame_offsets_s,
+                "num_condition_frames": len(frame_indices),
+                "tokens_per_frame": tokens_per_frame,
+                "condition_time_shape": [len(frame_indices) * tokens_per_frame],
+                "max_frame_time_error_s": max_frame_time_error_s,
+                "causal_tolerance_s": causal_tolerance_s,
+            }
+        )
+    if cache_type == "planner_vision_condition_v3":
+        metadata.update(
+            {
+                "ego_motion_shape": [ego_tokens, ego_state_dim],
+                "ego_motion_state_fields": list(ego_config["state_fields"]),
+                "ego_motion_scales": list(map(float, ego_config["scales"])),
+            }
+        )
     args.output.mkdir(parents=True, exist_ok=True)
     index_path = args.output / "index.json"
     shards: list[dict[str, object]] = []
@@ -148,6 +286,9 @@ def main() -> None:
     )
     pending_tokens: list[torch.Tensor] = []
     pending_masks: list[torch.Tensor] = []
+    pending_times: list[torch.Tensor] = []
+    pending_ego_states: list[torch.Tensor] = []
+    pending_ego_times: list[torch.Tensor] = []
     shard_index = len(shards)
     resume_count = count
     started = time.time()
@@ -170,14 +311,21 @@ def main() -> None:
             return
         tokens = torch.cat(pending_tokens).contiguous()
         masks = torch.cat(pending_masks).contiguous()
+        condition_times = torch.cat(pending_times).contiguous()
         start = count - len(tokens)
         filename = f"features_{shard_index:05d}.safetensors"
         destination = args.output / filename
         temporary = destination.with_suffix(destination.suffix + ".tmp")
+        tensors = {"condition_tokens": tokens, "condition_mask": masks}
+        if cache_type in {"planner_vision_condition_v2", "planner_vision_condition_v3"}:
+            tensors["condition_times"] = condition_times
+        if cache_type == "planner_vision_condition_v3":
+            tensors["ego_motion_states"] = torch.cat(pending_ego_states).contiguous()
+            tensors["ego_motion_times"] = torch.cat(pending_ego_times).contiguous()
         save_file(
-            {"condition_tokens": tokens, "condition_mask": masks},
+            tensors,
             str(temporary),
-            metadata={"cache_type": "planner_vision_condition_v1"},
+            metadata={"cache_type": cache_type},
         )
         os.replace(temporary, destination)
         shards.append(
@@ -190,6 +338,9 @@ def main() -> None:
         )
         pending_tokens.clear()
         pending_masks.clear()
+        pending_times.clear()
+        pending_ego_states.clear()
+        pending_ego_times.clear()
         shard_index += 1
         write_index(complete=False)
 
@@ -197,11 +348,27 @@ def main() -> None:
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     with torch.inference_mode():
         for batch in loader:
+            images = batch["images"]
+            batch_size, frame_count = images.shape[:2]
             with torch.autocast("cuda", dtype=amp_dtype):
-                condition = extractor(batch["image"].cuda(non_blocking=True))
-            pending_tokens.append(condition.tokens.to(dtype=output_dtype).cpu())
-            pending_masks.append(condition.token_mask.cpu())
-            count += condition.tokens.shape[0]
+                condition = extractor(
+                    images.flatten(0, 1).cuda(non_blocking=True)
+                )
+            token_count, feature_dim = condition.tokens.shape[1:]
+            tokens = condition.tokens.reshape(
+                batch_size, frame_count * token_count, feature_dim
+            )
+            masks = condition.token_mask.reshape(batch_size, frame_count * token_count)
+            times = batch["frame_times"].unsqueeze(-1).expand(
+                -1, -1, token_count
+            ).reshape(batch_size, frame_count * token_count)
+            pending_tokens.append(tokens.to(dtype=output_dtype).cpu())
+            pending_masks.append(masks.cpu())
+            pending_times.append(times.cpu())
+            if cache_type == "planner_vision_condition_v3":
+                pending_ego_states.append(batch["ego_motion_states"].cpu())
+                pending_ego_times.append(batch["ego_motion_times"].cpu())
+            count += batch_size
             if sum(len(value) for value in pending_tokens) >= args.shard_size:
                 flush()
             if count % 100 == 0 or count == len(dataset):

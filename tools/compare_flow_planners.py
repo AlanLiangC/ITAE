@@ -59,6 +59,10 @@ def main() -> None:
         raise ValueError("Raw/token evaluation scene order differs")
     if raw_meta.get("vision_condition_hash") != token_meta.get("vision_condition_hash"):
         raise ValueError("Raw/token evaluations used different vision conditions")
+    if raw_meta.get("ego_motion_condition_hash") != token_meta.get(
+        "ego_motion_condition_hash"
+    ):
+        raise ValueError("Raw/token evaluations used different ego-motion conditions")
     if raw_meta.get("planner_core_hash") != token_meta.get("planner_core_hash"):
         raise ValueError("Raw/token evaluations used different planner core configs")
     raw_parameters = int(raw_meta["parameter_count"])

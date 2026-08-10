@@ -97,7 +97,7 @@ class PlannerTargetNormalizer(nn.Module):
 
 
 class PlannerVisionCache:
-    """Strict reader for sharded current-frame vision-condition caches."""
+    """Strict reader for sharded single- or multi-frame vision caches."""
 
     def __init__(
         self,
@@ -110,7 +110,12 @@ class PlannerVisionCache:
         if not index_path.is_file():
             raise FileNotFoundError(f"Planner vision cache index does not exist: {index_path}")
         self.index = json.loads(index_path.read_text(encoding="utf-8"))
-        if self.index.get("cache_type") != "planner_vision_condition_v1":
+        self.cache_type = str(self.index.get("cache_type"))
+        if self.cache_type not in {
+            "planner_vision_condition_v1",
+            "planner_vision_condition_v2",
+            "planner_vision_condition_v3",
+        }:
             raise ValueError("Unsupported planner vision cache type")
         if not self.index.get("complete", False):
             raise ValueError("Planner vision cache is incomplete")
@@ -142,7 +147,9 @@ class PlannerVisionCache:
     def __len__(self) -> int:
         return self.num_samples
 
-    def __getitem__(self, index: int) -> tuple[Tensor, Tensor]:
+    def __getitem__(
+        self, index: int
+    ) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None, Tensor | None]:
         shard_index = self._sample_to_shard[index]
         shard = self.shards[shard_index]
         filename = str(shard["file"])
@@ -153,10 +160,42 @@ class PlannerVisionCache:
                     raise ValueError(f"Planner vision cache shard is corrupt: {path}")
                 self._verified_files.add(filename)
             tensors = load_file(str(path))
-            if set(tensors) != {"condition_tokens", "condition_mask"}:
+            expected_keys = {"condition_tokens", "condition_mask"}
+            if self.cache_type in {
+                "planner_vision_condition_v2",
+                "planner_vision_condition_v3",
+            }:
+                expected_keys.add("condition_times")
+            if self.cache_type == "planner_vision_condition_v3":
+                expected_keys.update({"ego_motion_states", "ego_motion_times"})
+            if set(tensors) != expected_keys:
                 raise ValueError("Planner vision cache shard tensor keys are invalid")
             if tuple(tensors["condition_tokens"].shape[1:]) != self.token_shape:
                 raise ValueError("Planner vision cache condition shape mismatch")
+            if tuple(tensors["condition_mask"].shape[1:]) != (self.token_shape[0],):
+                raise ValueError("Planner vision cache mask shape mismatch")
+            if self.cache_type in {
+                "planner_vision_condition_v2",
+                "planner_vision_condition_v3",
+            }:
+                condition_times = tensors["condition_times"]
+                if tuple(condition_times.shape[1:]) != (self.token_shape[0],):
+                    raise ValueError("Planner vision cache time shape mismatch")
+                if not torch.isfinite(condition_times).all():
+                    raise ValueError("Planner vision cache contains non-finite times")
+                tolerance = float(self.index.get("causal_tolerance_s", 0.0))
+                if torch.any(condition_times > tolerance + 1e-6):
+                    raise ValueError("Planner vision cache contains future condition tokens")
+            if self.cache_type == "planner_vision_condition_v3":
+                ego_shape = tuple(map(int, self.index["ego_motion_shape"]))
+                if tuple(tensors["ego_motion_states"].shape[1:]) != ego_shape:
+                    raise ValueError("Planner cache ego-motion shape mismatch")
+                if tuple(tensors["ego_motion_times"].shape[1:]) != (ego_shape[0],):
+                    raise ValueError("Planner cache ego-motion time shape mismatch")
+                if not torch.isfinite(tensors["ego_motion_states"]).all():
+                    raise ValueError("Planner cache contains non-finite ego-motion states")
+                if torch.any(tensors["ego_motion_times"] > tolerance + 1e-6):
+                    raise ValueError("Planner cache contains future ego-motion states")
             self._loaded_tensors = tensors
             self._loaded_shard_index = shard_index
         assert self._loaded_tensors is not None
@@ -164,6 +203,22 @@ class PlannerVisionCache:
         return (
             self._loaded_tensors["condition_tokens"][offset],
             self._loaded_tensors["condition_mask"][offset].bool(),
+            (
+                self._loaded_tensors["condition_times"][offset].float()
+                if self.cache_type
+                in {"planner_vision_condition_v2", "planner_vision_condition_v3"}
+                else None
+            ),
+            (
+                self._loaded_tensors["ego_motion_states"][offset].float()
+                if self.cache_type == "planner_vision_condition_v3"
+                else None
+            ),
+            (
+                self._loaded_tensors["ego_motion_times"][offset].float()
+                if self.cache_type == "planner_vision_condition_v3"
+                else None
+            ),
         )
 
 
@@ -265,9 +320,17 @@ class PlannerDataset(Dataset[dict[str, Tensor | str]]):
             with Image.open(window.image_paths[0]) as image:
                 sample["current_image"] = self.transform(image)
         else:
-            tokens, mask = self.vision_cache[index]
+            tokens, mask, condition_times, ego_motion, ego_motion_times = (
+                self.vision_cache[index]
+            )
             sample["condition_tokens"] = tokens
             sample["condition_mask"] = mask
+            if condition_times is not None:
+                sample["condition_times"] = condition_times
+            if ego_motion is not None:
+                assert ego_motion_times is not None
+                sample["ego_motion"] = ego_motion
+                sample["ego_motion_times"] = ego_motion_times
         return sample
 
     def all_targets(self) -> Tensor:

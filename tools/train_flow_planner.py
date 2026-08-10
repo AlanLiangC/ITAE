@@ -80,6 +80,8 @@ def make_dataset(
             "for any registered backbone"
         )
     target_type = str(config["planner"]["target"])
+    ego = config.get("ego_motion_condition", {})
+    ego_enabled = bool(ego.get("enabled", False))
     return PlannerDataset(
         manifest,
         target_type=target_type,
@@ -93,6 +95,16 @@ def make_dataset(
             "backbone_type": vision["type"],
             "model_name": vision.get("model_name", vision["type"]),
             "checkpoint_sha256": vision.get("checkpoint_sha256"),
+            "frame_indices": vision.get("frame_indices"),
+            "condition_frame_offsets_s": vision.get("frame_offsets_s"),
+            "current_frame_index": vision.get("current_frame_index"),
+            "ego_motion_shape": (
+                [int(ego["num_tokens"]), int(ego["state_dim"])]
+                if ego_enabled
+                else None
+            ),
+            "ego_motion_state_fields": ego.get("state_fields") if ego_enabled else None,
+            "ego_motion_scales": ego.get("scales") if ego_enabled else None,
         },
     )
 
@@ -361,6 +373,15 @@ def main() -> None:
                 target = normalizer.normalize(batch["target"].to(context.device).float())
                 condition = batch["condition_tokens"].to(context.device).float()
                 condition_mask = batch["condition_mask"].to(context.device)
+                condition_times = batch.get("condition_times")
+                if condition_times is not None:
+                    condition_times = condition_times.to(context.device).float()
+                ego_motion = batch.get("ego_motion")
+                ego_motion_times = batch.get("ego_motion_times")
+                if ego_motion is not None:
+                    assert ego_motion_times is not None
+                    ego_motion = ego_motion.to(context.device).float()
+                    ego_motion_times = ego_motion_times.to(context.device).float()
                 future_times = batch["future_times"].to(context.device).float()
                 slot_times = planner_slot_times(
                     str(config["planner"]["target"]), future_times, target_shape[0]
@@ -376,6 +397,9 @@ def main() -> None:
                         condition,
                         condition_mask,
                         slot_times,
+                        condition_times=condition_times,
+                        ego_motion=ego_motion,
+                        ego_motion_times=ego_motion_times,
                         generator=noise_generator,
                         time_generator=time_generator,
                     )
@@ -468,17 +492,44 @@ def main() -> None:
                             )
                             for item_index in range(item_count):
                                 window = visualization_windows[item_index]
-                                with Image.open(window.image_paths[0]) as image:
-                                    rgb = torch.from_numpy(
-                                        np.asarray(image.convert("RGB"), dtype=np.uint8).copy()
+                                frame_indices = list(
+                                    map(
+                                        int,
+                                        config["vision_condition"].get(
+                                            "frame_indices", [0]
+                                        ),
                                     )
-                                    rgb = rgb.permute(2, 0, 1).float() / 255.0
+                                )
+                                rgb_frames = []
+                                for frame_index in frame_indices:
+                                    with Image.open(
+                                        window.image_paths[frame_index]
+                                    ) as image:
+                                        rgb = torch.from_numpy(
+                                            np.asarray(
+                                                image.convert("RGB"), dtype=np.uint8
+                                            ).copy()
+                                        )
+                                        rgb_frames.append(
+                                            rgb.permute(2, 0, 1).float() / 255.0
+                                        )
                                 diagnostic = render_planner_diagnostic(
-                                    rgb,
+                                    torch.stack(rgb_frames),
                                     evaluation.targets[item_index],
                                     evaluation.predictions[item_index],
                                     evaluation.future_times[item_index],
                                     evaluation.sample_tokens[item_index],
+                                    frame_times=torch.tensor(
+                                        [
+                                            window.frame_times_s[index]
+                                            for index in frame_indices
+                                        ]
+                                    ),
+                                    ego_motion=(
+                                        None
+                                        if window.ego_motion_states is None
+                                        else torch.tensor(window.ego_motion_states)
+                                    ),
                                 )
                                 writer.add_image(
                                     f"validation/items/{item_index:02d}",

@@ -13,6 +13,9 @@ def flow_matching_loss(
     condition_tokens: Tensor,
     condition_mask: Tensor,
     slot_times: Tensor,
+    condition_times: Tensor | None = None,
+    ego_motion: Tensor | None = None,
+    ego_motion_times: Tensor | None = None,
     generator: torch.Generator | None = None,
     time_generator: torch.Generator | None = None,
 ) -> tuple[Tensor, dict[str, Tensor]]:
@@ -33,8 +36,16 @@ def flow_matching_loss(
     broadcast_time = time.view(batch, *([1] * (clean_target.ndim - 1)))
     interpolated = (1.0 - broadcast_time) * noise + broadcast_time * clean_target
     target_velocity = clean_target - noise
-    prediction = model(
-        interpolated, time, condition_tokens, condition_mask, slot_times
+    model_args = (interpolated, time, condition_tokens, condition_mask, slot_times)
+    prediction = (
+        model(*model_args)
+        if condition_times is None and ego_motion is None
+        else model(
+            *model_args,
+            condition_times,
+            ego_motion,
+            ego_motion_times,
+        )
     )
     per_sample = functional.mse_loss(
         prediction.float(), target_velocity.float(), reduction="none"
@@ -55,6 +66,9 @@ def euler_sample(
     condition_mask: Tensor,
     slot_times: Tensor,
     target_shape: tuple[int, int],
+    condition_times: Tensor | None = None,
+    ego_motion: Tensor | None = None,
+    ego_motion_times: Tensor | None = None,
     steps: int = 5,
     noise: Tensor | None = None,
     generator: torch.Generator | None = None,
@@ -80,7 +94,17 @@ def euler_sample(
         time = torch.full(
             (batch,), index / steps, dtype=state.dtype, device=state.device
         )
-        velocity = model(state, time, condition_tokens, condition_mask, slot_times)
+        model_args = (state, time, condition_tokens, condition_mask, slot_times)
+        velocity = (
+            model(*model_args)
+            if condition_times is None and ego_motion is None
+            else model(
+                *model_args,
+                condition_times,
+                ego_motion,
+                ego_motion_times,
+            )
+        )
         state = state + delta * velocity
         nfe += 1
     if expected_nfe is not None and nfe != expected_nfe:

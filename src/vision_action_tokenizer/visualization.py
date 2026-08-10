@@ -424,9 +424,26 @@ def render_planner_diagnostic(
     sample_token: str = "",
     width: int = 1200,
     height: int = 800,
+    frame_times: Tensor | np.ndarray | None = None,
+    ego_motion: Tensor | np.ndarray | None = None,
 ) -> Tensor:
-    """Render current RGB, GT, prediction and their BEV overlay in a 2x2 page."""
-    image = _camera_frame_to_image(current_image)
+    """Render condition RGB frames, GT, prediction and overlay in a 2x2 page."""
+    frame_array = _to_numpy(current_image)
+    if frame_array.ndim == 3:
+        frame_array = frame_array[None]
+    if frame_array.ndim != 4:
+        raise ValueError("Planner condition images must have shape [F,3,H,W]")
+    images = [_camera_frame_to_image(frame) for frame in frame_array]
+    time_values = (
+        np.arange(len(images), dtype=np.float32)
+        if frame_times is None
+        else _to_numpy(frame_times).reshape(-1)
+    )
+    if len(time_values) != len(images):
+        raise ValueError("frame_times must align with planner condition images")
+    ego_values = None if ego_motion is None else _to_numpy(ego_motion)
+    if ego_values is not None and ego_values.shape != (len(images), 6):
+        raise ValueError("ego_motion must have shape [condition_frames,6]")
     target_np = _to_numpy(target)
     prediction_np = _to_numpy(prediction)
     times = _to_numpy(future_times).reshape(-1)
@@ -468,18 +485,40 @@ def render_planner_diagnostic(
             width=2,
         )
 
-    camera = ImageOps.contain(
-        image, (round(panel_w - 24 * scale), round(panel_h - 46 * scale))
-    )
-    camera_left = round(panels[0][0] + (panel_w - camera.width) / 2)
-    camera_top = round(panels[0][1] + 34 * scale)
-    canvas.paste(camera, (camera_left, camera_top))
     draw.text(
         (panels[0][0] + 12 * scale, panels[0][1] + 8 * scale),
-        "Current CAM_FRONT (only planner input)",
+        f"CAM_FRONT condition ({len(images)} frame{'s' if len(images) != 1 else ''})",
         fill=(235, 238, 245),
         font=small_font,
     )
+    inner_gap = 7 * scale
+    content_width = panel_w - 24 * scale
+    cell_width = (content_width - (len(images) - 1) * inner_gap) / len(images)
+    cell_height = panel_h - 53 * scale
+    for frame_index, (image, relative_time) in enumerate(
+        zip(images, time_values, strict=True)
+    ):
+        cell_left = panels[0][0] + 12 * scale + frame_index * (
+            cell_width + inner_gap
+        )
+        thumbnail = ImageOps.contain(
+            image,
+            (max(1, round(cell_width)), max(1, round(cell_height - 18 * scale))),
+            Image.Resampling.LANCZOS,
+        )
+        paste_x = round(cell_left + (cell_width - thumbnail.width) / 2)
+        paste_y = round(panels[0][1] + 48 * scale)
+        canvas.paste(thumbnail, (paste_x, paste_y))
+        label = f"t={float(relative_time):+.2f}s"
+        if ego_values is not None:
+            speed = float(np.linalg.norm(ego_values[frame_index, 3:5]))
+            label += f" | v{speed:.1f} r{ego_values[frame_index, 5]:+.2f}"
+        draw.text(
+            (cell_left, panels[0][1] + 31 * scale),
+            label,
+            fill=(205, 210, 220),
+            font=small_font,
+        )
 
     all_xy = np.vstack([np.zeros((1, 2)), target_np[:, :2], prediction_np[:, :2]])
     x_min, y_min = all_xy.min(axis=0)

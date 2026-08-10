@@ -20,6 +20,16 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--train-manifest", required=True, type=Path)
     parser.add_argument("--final-manifest", required=True, type=Path)
+    parser.add_argument(
+        "--sample-universe-train-manifest",
+        type=Path,
+        help="Optional manifest whose sample tokens define the allowed train universe",
+    )
+    parser.add_argument(
+        "--sample-universe-final-manifest",
+        type=Path,
+        help="Optional manifest whose sample tokens define the allowed final universe",
+    )
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--validation-fraction", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
@@ -29,6 +39,22 @@ def main() -> None:
 
     windows = load_manifest(args.train_manifest)
     final_windows = load_manifest(args.final_manifest)
+    input_train_count = len(windows)
+    input_final_count = len(final_windows)
+    if args.sample_universe_train_manifest is not None:
+        allowed = {
+            window.sample_token
+            for window in load_manifest(args.sample_universe_train_manifest)
+        }
+        windows = [window for window in windows if window.sample_token in allowed]
+    if args.sample_universe_final_manifest is not None:
+        allowed = {
+            window.sample_token
+            for window in load_manifest(args.sample_universe_final_manifest)
+        }
+        final_windows = [
+            window for window in final_windows if window.sample_token in allowed
+        ]
     train_scenes = sorted({window.scene_token for window in windows})
     final_scenes = {window.scene_token for window in final_windows}
     overlap = set(train_scenes) & final_scenes
@@ -58,6 +84,20 @@ def main() -> None:
         "source_train_sha256": _sha256(args.train_manifest),
         "source_final_manifest": str(args.final_manifest),
         "source_final_sha256": _sha256(args.final_manifest),
+        "sample_universe": {
+            "train_manifest": (
+                None
+                if args.sample_universe_train_manifest is None
+                else str(args.sample_universe_train_manifest)
+            ),
+            "final_manifest": (
+                None
+                if args.sample_universe_final_manifest is None
+                else str(args.sample_universe_final_manifest)
+            ),
+            "filtered_train_samples": input_train_count - len(windows),
+            "filtered_final_samples": input_final_count - len(final_windows),
+        },
         "splits": {
             name: {
                 "path": str(path),

@@ -287,6 +287,70 @@
             }
         },
         {
+            "name": "ITAE Planner 2Hz3F: Cache PE train",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/alan/miniconda3/envs/py312torch210cu126/bin/python",
+            "program": "${workspaceFolder}/tools/cache_planner_vision_features.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "--config", "${workspaceFolder}/configs/planner/nuscenes_flow_raw_pe_2hz3f_4s.yaml",
+                "--manifest", "${workspaceFolder}/data/manifests/nuscenes_planner_2hz3f_front_4s/planner_train.jsonl",
+                "--output", "/home/alan/AlanLiang/Dataset/itae_planner_cache/pe_spatial_b16_512_2hz3f_ego_motion/train",
+                "--batch-size", "8",
+                "--shard-size", "256",
+                "--num-workers", "4"
+            ],
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+            }
+        },
+        {
+            "name": "ITAE Planner 2Hz3F: Train raw PE",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/alan/miniconda3/envs/py312torch210cu126/bin/python",
+            "program": "${workspaceFolder}/tools/train_flow_planner.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": [
+                "--config", "${workspaceFolder}/configs/planner/nuscenes_flow_raw_pe_2hz3f_4s.yaml",
+                "--train-manifest", "${workspaceFolder}/data/manifests/nuscenes_planner_2hz3f_front_4s/planner_train.jsonl",
+                "--val-manifest", "${workspaceFolder}/data/manifests/nuscenes_planner_2hz3f_front_4s/planner_validation.jsonl",
+                "--output", "${workspaceFolder}/output/planner_raw_pe_2hz3f_ego_seed42",
+                "--seed", "42"
+            ],
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+            }
+        },
+        {
+            "name": "ITAE Planner 2Hz3F: Train V4 token PE",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/alan/miniconda3/envs/py312torch210cu126/bin/python",
+            "program": "${workspaceFolder}/tools/train_flow_planner.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": [
+                "--config", "${workspaceFolder}/configs/planner/nuscenes_flow_token_v4_pe_2hz3f_4s.yaml",
+                "--train-manifest", "${workspaceFolder}/data/manifests/nuscenes_planner_2hz3f_front_4s/planner_train.jsonl",
+                "--val-manifest", "${workspaceFolder}/data/manifests/nuscenes_planner_2hz3f_front_4s/planner_validation.jsonl",
+                "--output", "${workspaceFolder}/output/planner_token_v4_pe_2hz3f_ego_seed42",
+                "--seed", "42"
+            ],
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+            }
+        },
+        {
             "name": "Python Debugger: Current File (py312torch210cu126)",
             "type": "debugpy",
             "request": "launch",

@@ -1,0 +1,6 @@
+[submodule "third_party/perception_models"]
+	path = third_party/perception_models
+	url = https://github.com/facebookresearch/perception_models.git
+[submodule "third_party/vggt-omega"]
+	path = third_party/vggt-omega
+	url = https://github.com/facebookresearch/vggt-omega.git

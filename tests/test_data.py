@@ -277,3 +277,15 @@ def test_manifest_uses_keyframe_images_and_measured_lidar_poses(tmp_path: Path) 
     manifest_path = tmp_path / "windows.jsonl"
     save_manifest(windows, manifest_path)
     assert manifest_scene_tokens(manifest_path) == {"scene"}
+
+
+def test_ego_motion_state_uses_only_aligned_history_poses() -> None:
+    anchor = make_transform([1, 0, 0, 0], [10.0, 0.0, 0.0])
+    poses = [
+        make_transform([1, 0, 0, 0], [5.0, 0.0, 0.0]),
+        make_transform([1, 0, 0, 0], [7.5, 0.0, 0.0]),
+        make_transform([1, 0, 0, 0], [10.0, 0.0, 0.0]),
+    ]
+    states = ManifestBuilder._ego_motion_states(anchor, poses, [-1.0, -0.5, 0.0])
+    np.testing.assert_allclose(states[:, :3], [[-5, 0, 0], [-2.5, 0, 0], [0, 0, 0]])
+    np.testing.assert_allclose(states[:, 3:], [[5, 0, 0]] * 3)

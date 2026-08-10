@@ -71,6 +71,8 @@ def main() -> None:
     if args.action_targets is not None:
         config["action_targets"]["cache"][args.split] = str(args.action_targets)
     vision = config["vision_condition"]
+    ego = config.get("ego_motion_condition", {})
+    ego_enabled = bool(ego.get("enabled", False))
     target_type = str(config["planner"]["target"])
     dataset = PlannerDataset(
         args.manifest,
@@ -85,6 +87,16 @@ def main() -> None:
             "backbone_type": vision["type"],
             "model_name": vision.get("model_name", vision["type"]),
             "checkpoint_sha256": vision.get("checkpoint_sha256"),
+            "frame_indices": vision.get("frame_indices"),
+            "condition_frame_offsets_s": vision.get("frame_offsets_s"),
+            "current_frame_index": vision.get("current_frame_index"),
+            "ego_motion_shape": (
+                [int(ego["num_tokens"]), int(ego["state_dim"])]
+                if ego_enabled
+                else None
+            ),
+            "ego_motion_state_fields": ego.get("state_fields") if ego_enabled else None,
+            "ego_motion_scales": ego.get("scales") if ego_enabled else None,
         },
     )
     if args.max_samples is not None:
@@ -177,6 +189,9 @@ def main() -> None:
         "state": state_key,
         "config_hash": stable_hash(config),
         "vision_condition_hash": stable_hash(config["vision_condition"]),
+        "ego_motion_condition_hash": stable_hash(
+            config.get("ego_motion_condition", {"enabled": False})
+        ),
         "planner_core_hash": stable_hash(config["planner"]["model"]),
         "parameter_count": sum(parameter.numel() for parameter in model.parameters()),
         "condition_shape": list(condition_shape),
@@ -197,15 +212,31 @@ def main() -> None:
         len(evaluation.predictions),
     )
     for index in range(item_count):
-        with Image.open(base_windows[index].image_paths[0]) as image:
-            rgb = torch.from_numpy(np.asarray(image.convert("RGB"), dtype=np.uint8).copy())
-            rgb = rgb.permute(2, 0, 1).float() / 255.0
+        window = base_windows[index]
+        frame_indices = list(
+            map(int, config["vision_condition"].get("frame_indices", [0]))
+        )
+        rgb_frames = []
+        for frame_index in frame_indices:
+            with Image.open(window.image_paths[frame_index]) as image:
+                rgb = torch.from_numpy(
+                    np.asarray(image.convert("RGB"), dtype=np.uint8).copy()
+                )
+                rgb_frames.append(rgb.permute(2, 0, 1).float() / 255.0)
         diagnostic = render_planner_diagnostic(
-            rgb,
+            torch.stack(rgb_frames),
             evaluation.targets[index],
             evaluation.predictions[index],
             evaluation.future_times[index],
             evaluation.sample_tokens[index],
+            frame_times=torch.tensor(
+                [window.frame_times_s[frame_index] for frame_index in frame_indices]
+            ),
+            ego_motion=(
+                None
+                if window.ego_motion_states is None
+                else torch.tensor(window.ego_motion_states)
+            ),
         )
         writer.add_image(f"evaluation/items/{index:02d}", diagnostic, 0)
     writer.close()
