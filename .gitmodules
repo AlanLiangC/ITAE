@@ -7,3 +7,6 @@
 [submodule "third_party/SUV"]
 	path = third_party/SUV
 	url = https://github.com/ASH-2046/SUV.git
+[submodule "third_party/navsim"]
+	path = third_party/navsim
+	url = https://github.com/autonomousvision/navsim.git
