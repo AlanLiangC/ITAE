@@ -32,7 +32,7 @@ sha256sum output/itae_vggt_omega_v4_output_residual/best.pt
 ## 1. 生成 scene-disjoint planner split
 
 ```bash
-python tools/split_planner_manifests.py \
+python tools/data/split_planner_manifests.py \
   --train-manifest data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
   --final-manifest data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl \
   --output data/manifests/nuscenes_planner_front_4s \
@@ -54,7 +54,7 @@ python tools/split_planner_manifests.py \
 
 ```bash
 for split in train validation final_eval; do
-  python tools/cache_planner_vision_features.py \
+  python tools/features/cache_planner_vision_features.py \
     --config configs/planner/nuscenes_flow_raw_pe_4s.yaml \
     --manifest data/manifests/nuscenes_planner_front_4s/planner_${split}.jsonl \
     --output /home/alan/AlanLiang/Dataset/itae_planner_cache/pe_spatial_b16_512/${split} \
@@ -76,7 +76,7 @@ planner train/validation 都是原 tokenizer-train manifest 的子集，所以�
 mkdir -p /home/alan/AlanLiang/Dataset/itae_planner_cache/v4_action_targets
 
 for split in train validation; do
-  python tools/cache_tokenizer_action_targets.py \
+  python tools/features/cache_tokenizer_action_targets.py \
     --tokenizer-config configs/nuscenes_vggt_omega_front_4s_v4_output_residual.yaml \
     --source-manifest data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
     --manifest data/manifests/nuscenes_planner_front_4s/planner_${split}.jsonl \
@@ -86,7 +86,7 @@ for split in train validation; do
     --batch-size 64
 done
 
-python tools/cache_tokenizer_action_targets.py \
+python tools/features/cache_tokenizer_action_targets.py \
   --tokenizer-config configs/nuscenes_vggt_omega_front_4s_v4_output_residual.yaml \
   --source-manifest data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl \
   --manifest data/manifests/nuscenes_planner_front_4s/planner_final_eval.jsonl \
@@ -105,14 +105,14 @@ rich cache、tokenizer config/checkpoint hash 和严格 sample order。
 
 ```bash
 for seed in 42 43 44; do
-  torchrun --standalone --nproc_per_node=1 tools/train_flow_planner.py \
+  torchrun --standalone --nproc_per_node=1 tools/training/train_flow_planner.py \
     --config configs/planner/nuscenes_flow_raw_pe_4s.yaml \
     --train-manifest data/manifests/nuscenes_planner_front_4s/planner_train.jsonl \
     --val-manifest data/manifests/nuscenes_planner_front_4s/planner_validation.jsonl \
     --output output/planner_raw_pe_seed${seed} \
     --seed ${seed}
 
-  torchrun --standalone --nproc_per_node=1 tools/train_flow_planner.py \
+  torchrun --standalone --nproc_per_node=1 tools/training/train_flow_planner.py \
     --config configs/planner/nuscenes_flow_token_v4_pe_4s.yaml \
     --train-manifest data/manifests/nuscenes_planner_front_4s/planner_train.jsonl \
     --val-manifest data/manifests/nuscenes_planner_front_4s/planner_validation.jsonl \
@@ -138,13 +138,13 @@ token42:output/planner_token_v4_pe_seed42/tensorboard \
 
 ```bash
 for seed in 42 43 44; do
-  python tools/evaluate_flow_planner.py \
+  python tools/evaluation/evaluate_flow_planner.py \
     --config configs/planner/nuscenes_flow_raw_pe_4s.yaml \
     --manifest data/manifests/nuscenes_planner_front_4s/planner_final_eval.jsonl \
     --checkpoint output/planner_raw_pe_seed${seed}/best.pt \
     --output output/planner_eval/raw_seed${seed}
 
-  python tools/evaluate_flow_planner.py \
+  python tools/evaluation/evaluate_flow_planner.py \
     --config configs/planner/nuscenes_flow_token_v4_pe_4s.yaml \
     --manifest data/manifests/nuscenes_planner_front_4s/planner_final_eval.jsonl \
     --checkpoint output/planner_token_v4_pe_seed${seed}/best.pt \
@@ -163,7 +163,7 @@ evaluator 强制 `steps=5` 且 `NFE=5`，保存：
 
 ```bash
 for seed in 42 43 44; do
-  python tools/compare_flow_planners.py \
+  python tools/evaluation/compare_flow_planners.py \
     --raw-eval output/planner_eval/raw_seed${seed} \
     --token-eval output/planner_eval/token_seed${seed} \
     --raw-history output/planner_raw_pe_seed${seed}/training_history.jsonl \
@@ -178,7 +178,7 @@ validation ADE AUC、达到 1.0/0.75/0.5 m 的 seen samples，以及 scene-level
 ## 7. 汇总三个 seed
 
 ```bash
-python tools/summarize_flow_planner_seeds.py \
+python tools/evaluation/summarize_flow_planner_seeds.py \
   --comparisons \
     output/planner_eval/comparison_seed42.json \
     output/planner_eval/comparison_seed43.json \

@@ -24,13 +24,13 @@ pip install -e '.[pe,dev,viz]'
 ```bash
 mkdir -p data/manifests/nuscenes_2hz3f_front_4s
 
-python tools/build_manifest.py \
+python tools/data/build_nuscenes_manifest.py \
   --config configs/planner/nuscenes_flow_raw_pe_2hz3f_4s.yaml \
   --info data/nuscenes/nuscenes_interp_12Hz_infos_train.pkl \
   --output data/manifests/nuscenes_2hz3f_front_4s/train.jsonl \
   --report data/manifests/nuscenes_2hz3f_front_4s/train_report.json
 
-python tools/build_manifest.py \
+python tools/data/build_nuscenes_manifest.py \
   --config configs/planner/nuscenes_flow_raw_pe_2hz3f_4s.yaml \
   --info data/nuscenes/nuscenes_interp_12Hz_infos_val.pkl \
   --output data/manifests/nuscenes_2hz3f_front_4s/val.jsonl \
@@ -46,7 +46,7 @@ python tools/build_manifest.py \
 为复用固定 V4 teacher 的原五帧 rich cache，raw/token 使用 teacher sample universe 的交集：
 
 ```bash
-python tools/split_planner_manifests.py \
+python tools/data/split_planner_manifests.py \
   --train-manifest data/manifests/nuscenes_2hz3f_front_4s/train.jsonl \
   --final-manifest data/manifests/nuscenes_2hz3f_front_4s/val.jsonl \
   --sample-universe-train-manifest data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
@@ -63,7 +63,7 @@ python tools/split_planner_manifests.py \
 
 ```bash
 for split in train validation final_eval; do
-  python tools/cache_planner_vision_features.py \
+  python tools/features/cache_planner_vision_features.py \
     --config configs/planner/nuscenes_flow_raw_pe_2hz3f_4s.yaml \
     --manifest data/manifests/nuscenes_planner_2hz3f_front_4s/planner_${split}.jsonl \
     --output /home/alan/AlanLiang/Dataset/itae_planner_cache/pe_spatial_b16_512_2hz3f_ego_motion/${split} \
@@ -81,7 +81,7 @@ cache v3 保存 PE token/mask/time，以及与三帧对齐的 LiDAR ego-motion s
 mkdir -p /home/alan/AlanLiang/Dataset/itae_planner_cache/v4_action_targets_2hz3f_ego_motion
 
 for split in train validation; do
-  python tools/cache_tokenizer_action_targets.py \
+  python tools/features/cache_tokenizer_action_targets.py \
     --tokenizer-config configs/nuscenes_vggt_omega_front_4s_v4_output_residual.yaml \
     --source-manifest data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
     --manifest data/manifests/nuscenes_planner_2hz3f_front_4s/planner_${split}.jsonl \
@@ -91,7 +91,7 @@ for split in train validation; do
     --batch-size 64
 done
 
-python tools/cache_tokenizer_action_targets.py \
+python tools/features/cache_tokenizer_action_targets.py \
   --tokenizer-config configs/nuscenes_vggt_omega_front_4s_v4_output_residual.yaml \
   --source-manifest data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl \
   --manifest data/manifests/nuscenes_planner_2hz3f_front_4s/planner_final_eval.jsonl \
@@ -119,13 +119,13 @@ flow 在标准化空间中使用 Gaussian source，预测直线路径 velocity�
 
 ```bash
 for seed in 42 43 44; do
-  torchrun --standalone --nproc_per_node=1 tools/train_flow_planner.py \
+  torchrun --standalone --nproc_per_node=1 tools/training/train_flow_planner.py \
     --config configs/planner/nuscenes_flow_raw_pe_2hz3f_4s.yaml \
     --train-manifest data/manifests/nuscenes_planner_2hz3f_front_4s/planner_train.jsonl \
     --val-manifest data/manifests/nuscenes_planner_2hz3f_front_4s/planner_validation.jsonl \
     --output output/planner_raw_pe_2hz3f_ego_seed${seed} --seed ${seed}
 
-  torchrun --standalone --nproc_per_node=1 tools/train_flow_planner.py \
+  torchrun --standalone --nproc_per_node=1 tools/training/train_flow_planner.py \
     --config configs/planner/nuscenes_flow_token_v4_pe_2hz3f_4s.yaml \
     --train-manifest data/manifests/nuscenes_planner_2hz3f_front_4s/planner_train.jsonl \
     --val-manifest data/manifests/nuscenes_planner_2hz3f_front_4s/planner_validation.jsonl \
@@ -148,19 +148,19 @@ token:output/planner_token_v4_pe_2hz3f_ego_seed42/tensorboard --port 6006
 ```bash
 mkdir -p output/planner_eval_2hz3f_ego
 for seed in 42 43 44; do
-  python tools/evaluate_flow_planner.py \
+  python tools/evaluation/evaluate_flow_planner.py \
     --config configs/planner/nuscenes_flow_raw_pe_2hz3f_4s.yaml \
     --manifest data/manifests/nuscenes_planner_2hz3f_front_4s/planner_final_eval.jsonl \
     --checkpoint output/planner_raw_pe_2hz3f_ego_seed${seed}/best.pt \
     --output output/planner_eval_2hz3f_ego/raw_seed${seed}
 
-  python tools/evaluate_flow_planner.py \
+  python tools/evaluation/evaluate_flow_planner.py \
     --config configs/planner/nuscenes_flow_token_v4_pe_2hz3f_4s.yaml \
     --manifest data/manifests/nuscenes_planner_2hz3f_front_4s/planner_final_eval.jsonl \
     --checkpoint output/planner_token_v4_pe_2hz3f_ego_seed${seed}/best.pt \
     --output output/planner_eval_2hz3f_ego/token_seed${seed}
 
-  python tools/compare_flow_planners.py \
+  python tools/evaluation/compare_flow_planners.py \
     --raw-eval output/planner_eval_2hz3f_ego/raw_seed${seed} \
     --token-eval output/planner_eval_2hz3f_ego/token_seed${seed} \
     --raw-history output/planner_raw_pe_2hz3f_ego_seed${seed}/training_history.jsonl \
@@ -168,7 +168,7 @@ for seed in 42 43 44; do
     --output output/planner_eval_2hz3f_ego/comparison_seed${seed}.json
 done
 
-python tools/summarize_flow_planner_seeds.py \
+python tools/evaluation/summarize_flow_planner_seeds.py \
   --comparisons output/planner_eval_2hz3f_ego/comparison_seed{42,43,44}.json \
   --output output/planner_eval_2hz3f_ego/three_seed_summary.json
 ```

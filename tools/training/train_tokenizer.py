@@ -4,13 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import math
 from collections import Counter
+from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import torch
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader, DistributedSampler, Subset, WeightedRandomSampler
+from torch.utils.data import DataLoader, DistributedSampler, Subset
 
 from vision_action_tokenizer.config import (
     load_config,
@@ -18,11 +21,17 @@ from vision_action_tokenizer.config import (
     seed_everything,
 )
 from vision_action_tokenizer.data.dataset import (
+    ActionWindowDataset,
     CachedVGGTOmegaFeatureDataset,
-    NuScenesWindowDataset,
+    MultiSourceActionDataset,
     VGGTOmegaResize,
 )
-from vision_action_tokenizer.data.manifest import WindowRecord, load_manifest, manifest_scene_tokens
+from vision_action_tokenizer.data.manifest import (
+    WindowRecord,
+    manifest_group_tokens,
+)
+from vision_action_tokenizer.data.sampler import DeterministicDistributedWeightedSampler
+from vision_action_tokenizer.data.trajectory import shift_se2_reference_point
 from vision_action_tokenizer.distributed import cleanup_distributed, initialize_distributed
 from vision_action_tokenizer.losses import LossConfig, TokenizerLoss
 from vision_action_tokenizer.models.factory import build_training_model
@@ -35,8 +44,8 @@ from vision_action_tokenizer.trainer import (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, type=Path)
-    parser.add_argument("--train-manifest", required=True, type=Path)
-    parser.add_argument("--val-manifest", required=True, type=Path)
+    parser.add_argument("--train-manifest", type=Path)
+    parser.add_argument("--val-manifest", type=Path)
     parser.add_argument("--output", required=True, type=Path)
     resume_group = parser.add_mutually_exclusive_group()
     resume_group.add_argument("--resume", type=Path, help="Explicit checkpoint override")
@@ -44,6 +53,16 @@ def parse_args() -> argparse.Namespace:
         "--no-resume", action="store_true", help="Ignore config/auto-resume and start fresh"
     )
     parser.add_argument("--overfit-samples", type=int)
+    parser.add_argument(
+        "--overfit-on-train",
+        action="store_true",
+        help="Diagnostic only: evaluate the selected training subset as validation",
+    )
+    parser.add_argument(
+        "--sources",
+        nargs="+",
+        help="Optional subset of config data.sources (for source-only ablations)",
+    )
     parser.add_argument("--epochs", type=int, help="Override train.epochs for smoke tests")
     parser.add_argument("--train-feature-cache", type=Path)
     parser.add_argument("--val-feature-cache", type=Path)
@@ -55,9 +74,63 @@ def cache_for_split(config: dict, split: str):
     return cache_config.get(split) if isinstance(cache_config, dict) else cache_config
 
 
-def make_dataset(manifest: Path, config: dict, split: str, overfit_samples: int | None = None):
-    cache = cache_for_split(config, split)
-    base = NuScenesWindowDataset(
+def _source_specs(
+    args: argparse.Namespace, config: dict[str, Any]
+) -> dict[str, dict[str, Any]]:
+    configured = config["data"].get("sources")
+    if configured:
+        if args.train_manifest is not None or args.val_manifest is not None:
+            raise ValueError("Manifest CLI overrides are only valid for single-source configs")
+        if args.train_feature_cache is not None or args.val_feature_cache is not None:
+            raise ValueError("Feature-cache CLI overrides are only valid for single-source configs")
+        result = {}
+        for name, values in configured.items():
+            reference_offset = tuple(
+                map(float, values.get("reference_point_offset_m", [0.0, 0.0]))
+            )
+            if len(reference_offset) != 2 or not all(math.isfinite(v) for v in reference_offset):
+                raise ValueError(
+                    f"{name}.reference_point_offset_m must contain two finite values"
+                )
+            result[str(name)] = {
+                "train_manifest": Path(values["train_manifest"]),
+                "val_manifest": Path(values["val_manifest"]),
+                "train_cache": Path(values["train_feature_cache"])
+                if values.get("train_feature_cache")
+                else None,
+                "val_cache": Path(values["val_feature_cache"])
+                if values.get("val_feature_cache")
+                else None,
+                "reference_point_offset_m": reference_offset,
+            }
+        return result
+    if args.train_manifest is None or args.val_manifest is None:
+        raise ValueError(
+            "Single-source configs require --train-manifest and --val-manifest"
+        )
+    if (args.train_feature_cache is None) != (args.val_feature_cache is None):
+        raise ValueError("Train and val feature-cache overrides must be provided together")
+    train_cache = args.train_feature_cache or cache_for_split(config, "train")
+    val_cache = args.val_feature_cache or cache_for_split(config, "val")
+    return {
+        "nuscenes": {
+            "train_manifest": args.train_manifest,
+            "val_manifest": args.val_manifest,
+            "train_cache": Path(train_cache) if train_cache else None,
+            "val_cache": Path(val_cache) if val_cache else None,
+            "reference_point_offset_m": (0.0, 0.0),
+        }
+    }
+
+
+def make_dataset(
+    manifest: Path,
+    cache: Path | None,
+    config: dict,
+    overfit_samples: int | None = None,
+    reference_point_offset_m: tuple[float, float] = (0.0, 0.0),
+):
+    base = ActionWindowDataset(
         manifest,
         transform=VGGTOmegaResize(
             image_resolution=int(config["vision_backbone"]["image_resolution"]),
@@ -65,6 +138,7 @@ def make_dataset(manifest: Path, config: dict, split: str, overfit_samples: int 
             patch_size=int(config["vision_backbone"]["patch_size"]),
         ),
         load_images=cache is None,
+        reference_point_offset_m=reference_point_offset_m,
     )
     dataset = (
         base
@@ -83,9 +157,20 @@ def make_dataset(manifest: Path, config: dict, split: str, overfit_samples: int 
             },
         )
     )
+    windows = [
+        replace(
+            window,
+            trajectory=shift_se2_reference_point(
+                window.trajectory, reference_point_offset_m
+            ).tolist(),
+        )
+        for window in base.windows
+    ]
     if overfit_samples is not None:
-        dataset = Subset(dataset, range(min(overfit_samples, len(dataset))))
-    return dataset
+        count = min(overfit_samples, len(dataset))
+        dataset = Subset(dataset, range(count))
+        windows = windows[:count]
+    return dataset, windows
 
 
 def motion_bucket(window: WindowRecord) -> str:
@@ -128,21 +213,29 @@ def speed_trend(
     return "steady"
 
 
-def make_motion_sampler(
-    manifest: Path,
+def make_weighted_sampler(
+    windows: list[WindowRecord],
+    source_names: list[str],
     config: dict,
     dataset_size: int,
-    overfit_samples: int | None,
     world_size: int,
-) -> WeightedRandomSampler | None:
+    rank: int,
+) -> DeterministicDistributedWeightedSampler | None:
+    if len(windows) != dataset_size or len(source_names) != dataset_size:
+        raise ValueError("Sampler windows/source names do not match the dataset")
+    sampling = config["data"].get("sampling", {})
+    strategy = str(sampling.get("strategy", "proportional"))
+    if strategy not in {"proportional", "balanced", "weighted"}:
+        raise ValueError("data.sampling.strategy must be proportional, balanced or weighted")
     balancing = config["train"].get("motion_balancing", {})
-    if not bool(balancing.get("enabled", False)):
-        return None
-    if world_size > 1:
-        raise ValueError(
-            "train.motion_balancing currently supports one process; disable it for DDP"
-        )
-    configured = balancing.get("bucket_weights", {})
+    motion_enabled = bool(balancing.get("enabled", False))
+    source_counts = Counter(source_names)
+    configured = balancing.get("bucket_weights", {}) if motion_enabled else {
+        "stationary": 1.0,
+        "straight_slow": 1.0,
+        "straight_fast": 1.0,
+        "turn": 1.0,
+    }
     bucket_names = {"stationary", "straight_slow", "straight_fast", "turn"}
     if set(configured) != bucket_names:
         raise ValueError(
@@ -152,7 +245,7 @@ def make_motion_sampler(
     bucket_weights = {name: float(value) for name, value in configured.items()}
     if any(value <= 0 for value in bucket_weights.values()):
         raise ValueError("Motion bucket weights must all be positive")
-    configured_trends = balancing.get("speed_trend_weights")
+    configured_trends = balancing.get("speed_trend_weights") if motion_enabled else None
     trend_names = {"stationary", "steady", "accelerating", "decelerating"}
     if configured_trends is None:
         trend_weights = {name: 1.0 for name in trend_names}
@@ -173,13 +266,6 @@ def make_motion_sampler(
     if trend_threshold <= 0:
         raise ValueError("speed_trend_threshold_mps must be positive")
 
-    windows = load_manifest(manifest)
-    if overfit_samples is not None:
-        windows = windows[:overfit_samples]
-    if len(windows) != dataset_size:
-        raise ValueError(
-            f"Sampler manifest/dataset mismatch: {len(windows)} != {dataset_size}"
-        )
     buckets = [motion_bucket(window) for window in windows]
     trends = [
         speed_trend(
@@ -189,14 +275,38 @@ def make_motion_sampler(
         )
         for window in windows
     ]
+    desired_source_weights = sampling.get("source_weights", {})
+    if strategy == "balanced":
+        desired_source_weights = {name: 1.0 for name in source_counts}
+    elif strategy == "proportional":
+        desired_source_weights = {name: float(count) for name, count in source_counts.items()}
+    if set(desired_source_weights) != set(source_counts):
+        raise ValueError(
+            "data.sampling.source_weights must define exactly the configured sources"
+        )
+    if any(float(value) <= 0 for value in desired_source_weights.values()):
+        raise ValueError("Source sampling weights must be positive")
+    motion_factors = [
+        bucket_weights[bucket] * trend_weights[trend]
+        for bucket, trend in zip(buckets, trends, strict=True)
+    ]
+    source_motion_totals = {
+        name: sum(
+            factor
+            for source, factor in zip(source_names, motion_factors, strict=True)
+            if source == name
+        )
+        for name in source_counts
+    }
     sample_weights = torch.tensor(
         [
-            bucket_weights[bucket] * trend_weights[trend]
-            for bucket, trend in zip(buckets, trends, strict=True)
+            float(desired_source_weights[source])
+            * factor
+            / source_motion_totals[source]
+            for source, factor in zip(source_names, motion_factors, strict=True)
         ],
         dtype=torch.double,
     )
-    generator = torch.Generator().manual_seed(int(config["seed"]))
     counts = Counter(buckets)
     trend_counts = Counter(trends)
     weighted_counts = {
@@ -211,33 +321,107 @@ def make_motion_sampler(
     expected = {
         name: weighted_counts[name] / normalization for name in sorted(bucket_names)
     }
+    weighted_source_totals = {
+        name: sum(
+            float(weight)
+            for source, weight in zip(source_names, sample_weights, strict=True)
+            if source == name
+        )
+        for name in source_counts
+    }
+    source_normalization = sum(weighted_source_totals.values())
+    expected_sources = {
+        name: value / source_normalization
+        for name, value in sorted(weighted_source_totals.items())
+    }
+    weighted_trend_totals = {
+        name: sum(
+            float(weight)
+            for trend, weight in zip(trends, sample_weights, strict=True)
+            if trend == name
+        )
+        for name in sorted(trend_names)
+    }
+    expected_trends = {
+        name: value / normalization for name, value in weighted_trend_totals.items()
+    }
+    config.setdefault("data_runtime", {})["sampling_expectation"] = {
+        "source": expected_sources,
+        "motion": expected,
+        "speed_trend": expected_trends,
+    }
     print(
-        f"Motion-balanced sampling counts={dict(counts)} trends={dict(trend_counts)} "
-        f"expected_fractions={expected}",
+        f"Weighted sampling sources={dict(source_counts)} motion={dict(counts)} "
+        f"trends={dict(trend_counts)} expected_sources={expected_sources} "
+        f"expected_motion_fractions={expected}",
         flush=True,
     )
-    return WeightedRandomSampler(
+    if strategy == "proportional" and not motion_enabled:
+        return None
+    requested_samples = sampling.get("samples_per_epoch")
+    num_samples = dataset_size if requested_samples is None else int(requested_samples)
+    return DeterministicDistributedWeightedSampler(
         sample_weights,
-        num_samples=dataset_size,
-        replacement=True,
-        generator=generator,
+        num_samples=num_samples,
+        seed=int(config["seed"]),
+        num_replicas=world_size,
+        rank=rank,
     )
 
 
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
+    if args.sources:
+        configured_sources = config["data"].get("sources")
+        if not configured_sources:
+            raise ValueError("--sources requires a multi-source config")
+        requested = list(dict.fromkeys(args.sources))
+        missing = set(requested) - set(configured_sources)
+        if missing:
+            raise ValueError(f"Unknown --sources: {sorted(missing)}")
+        config["data"]["sources"] = {
+            name: configured_sources[name] for name in requested
+        }
+        sampling_weights = config["data"].get("sampling", {}).get("source_weights")
+        if sampling_weights is not None:
+            config["data"]["sampling"]["source_weights"] = {
+                name: sampling_weights[name] for name in requested
+            }
     if args.epochs is not None:
         if args.epochs <= 0:
             raise ValueError("--epochs must be positive")
         config["train"]["epochs"] = args.epochs
-    if (args.train_feature_cache is None) != (args.val_feature_cache is None):
-        raise ValueError("Train and val feature-cache overrides must be provided together")
-    if args.train_feature_cache is not None:
-        config["data"]["feature_cache"] = {
-            "train": str(args.train_feature_cache),
-            "val": str(args.val_feature_cache),
+    source_specs = _source_specs(args, config)
+    if args.overfit_on_train:
+        if args.overfit_samples is None:
+            raise ValueError("--overfit-on-train requires --overfit-samples")
+        for spec in source_specs.values():
+            spec["val_manifest"] = spec["train_manifest"]
+            spec["val_cache"] = spec["train_cache"]
+    runtime_sources: dict[str, dict[str, Any]] = {}
+    for source_name, spec in source_specs.items():
+        train_manifest = spec["train_manifest"]
+        val_manifest = spec["val_manifest"]
+        assert isinstance(train_manifest, Path) and isinstance(val_manifest, Path)
+        if not train_manifest.is_file() or not val_manifest.is_file():
+            raise FileNotFoundError(
+                f"Missing {source_name} manifest: {train_manifest} or {val_manifest}"
+            )
+        overlap = manifest_group_tokens(train_manifest) & manifest_group_tokens(val_manifest)
+        if overlap and not args.overfit_on_train:
+            raise ValueError(
+                f"{source_name} train/val group leakage: {len(overlap)} groups; "
+                f"examples={sorted(overlap)[:5]}"
+            )
+        runtime_sources[source_name] = {
+            "train_manifest_sha256": hashlib.sha256(train_manifest.read_bytes()).hexdigest(),
+            "val_manifest_sha256": hashlib.sha256(val_manifest.read_bytes()).hexdigest(),
+            "train_cache": str(spec["train_cache"]) if spec["train_cache"] else None,
+            "val_cache": str(spec["val_cache"]) if spec["val_cache"] else None,
+            "reference_point_offset_m": list(spec["reference_point_offset_m"]),
         }
+    config["data_runtime"] = {"sources": runtime_sources}
     resume_checkpoint = resolve_resume_checkpoint(
         config,
         args.output,
@@ -251,22 +435,53 @@ def main() -> None:
         else:
             print(f"Resuming training from {resume_checkpoint}", flush=True)
     seed_everything(int(config["seed"]) + context.rank)
-    train_scenes = manifest_scene_tokens(args.train_manifest)
-    val_scenes = manifest_scene_tokens(args.val_manifest)
-    overlap = train_scenes & val_scenes
-    if overlap:
-        examples = sorted(overlap)[:5]
-        raise ValueError(
-            f"Train/val scene leakage: {len(overlap)} overlapping scenes; examples={examples}"
+    train_sources = {}
+    val_sources = {}
+    train_windows: list[WindowRecord] = []
+    train_source_names: list[str] = []
+    cache_modes: set[bool] = set()
+    for source_name, spec in source_specs.items():
+        train_manifest = spec["train_manifest"]
+        val_manifest = spec["val_manifest"]
+        assert isinstance(train_manifest, Path) and isinstance(val_manifest, Path)
+        train_cache = spec["train_cache"]
+        val_cache = spec["val_cache"]
+        assert train_cache is None or isinstance(train_cache, Path)
+        assert val_cache is None or isinstance(val_cache, Path)
+        if (train_cache is None) != (val_cache is None):
+            raise ValueError(f"{source_name} train/val cache mode must match")
+        cache_modes.add(train_cache is not None)
+        train_dataset_part, source_windows = make_dataset(
+            train_manifest,
+            train_cache,
+            config,
+            args.overfit_samples,
+            reference_point_offset_m=spec["reference_point_offset_m"],
         )
-    train_dataset = make_dataset(args.train_manifest, config, "train", args.overfit_samples)
-    val_dataset = make_dataset(args.val_manifest, config, "val", args.overfit_samples)
-    train_sampler = make_motion_sampler(
-        args.train_manifest,
+        val_dataset_part, _ = make_dataset(
+            val_manifest,
+            val_cache,
+            config,
+            args.overfit_samples,
+            reference_point_offset_m=spec["reference_point_offset_m"],
+        )
+        train_sources[source_name] = train_dataset_part
+        val_sources[source_name] = val_dataset_part
+        train_windows.extend(source_windows)
+        train_source_names.extend([source_name] * len(source_windows))
+        runtime_sources[source_name]["num_train_windows"] = len(source_windows)
+        runtime_sources[source_name]["num_val_windows"] = len(val_dataset_part)
+    if len(cache_modes) != 1:
+        raise ValueError("All sources must consistently use online features or caches")
+    train_dataset = MultiSourceActionDataset(train_sources)
+    val_dataset = MultiSourceActionDataset(val_sources)
+    train_sampler = make_weighted_sampler(
+        train_windows,
+        train_source_names,
         config,
         len(train_dataset),
-        args.overfit_samples,
         context.world_size,
+        context.rank,
     )
     if train_sampler is None and context.world_size > 1:
         train_sampler = DistributedSampler(train_dataset, shuffle=True)
@@ -289,11 +504,7 @@ def main() -> None:
         pin_memory=context.device.type == "cuda",
         persistent_workers=int(config["data"]["num_workers"]) > 0,
     )
-    train_cached = cache_for_split(config, "train") is not None
-    val_cached = cache_for_split(config, "val") is not None
-    if train_cached != val_cached:
-        raise ValueError("Train and val must both use online VGGT-Omega or feature caches")
-    cached = train_cached
+    cached = cache_modes.pop()
     if not cached and int(config["train"]["batch_size"]) != 1:
         raise ValueError("Online VGGT-Omega training requires train.batch_size=1 on this GPU")
     model = build_training_model(config, cached=cached)
@@ -401,6 +612,8 @@ def main() -> None:
     else:
         start_epoch = 0
         initial_checkpoint = config["train"].get("initial_checkpoint")
+        if config["data"].get("sources") and initial_checkpoint not in (None, ""):
+            raise ValueError("Joint scratch training forbids train.initial_checkpoint")
         if initial_checkpoint not in (None, ""):
             evaluate_initial = bool(
                 config["train"].get("evaluate_initial_checkpoint", False)

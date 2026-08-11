@@ -15,6 +15,9 @@ action token，再从 token 重建输入视觉窗口内的 40 个 LiDAR ego pose
 轨迹不是“视觉窗口之后的未来”：anchor 是第 1 张图，40 点覆盖 5 张输入图之间的同一段 4 s
 时间。图像来自 1 Hz keyframe；轨迹来自 10 Hz LiDAR keyframe/sweep 的标定后 ego pose。
 
+NAVSIM mini 与 nuScenes 的 V4 scratch 联合训练、2Hz→10Hz 插值审计和完整命令见
+[`docs/navsim_task/experiment_guide.md`](docs/navsim_task/experiment_guide.md)。
+
 ## 环境与权重
 
 当前验证环境：
@@ -61,7 +64,7 @@ data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl    #  4,017
 如需重建 manifest：
 
 ```bash
-python tools/build_manifest.py \
+python tools/data/build_nuscenes_manifest.py \
   --config configs/nuscenes_vggt_omega_front_4s.yaml \
   --info data/nuscenes/nuscenes_interp_12Hz_infos_train.pkl \
   --output data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
@@ -73,12 +76,12 @@ python tools/build_manifest.py \
 在训练前必须检查 pose 的方向、frame order 和尺度：
 
 ```bash
-python tools/inspect_vggt_camera_motion.py \
+python tools/analysis/inspect_vggt_camera_motion.py \
   --config configs/nuscenes_vggt_omega_front_4s.yaml \
   --manifest data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
   --output-dir output/vggt_camera_motion_audit/train
 
-python tools/inspect_vggt_camera_motion.py \
+python tools/analysis/inspect_vggt_camera_motion.py \
   --config configs/nuscenes_vggt_omega_front_4s.yaml \
   --manifest data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl \
   --calibration output/vggt_camera_motion_audit/train/camera_motion_calibration.json \
@@ -93,7 +96,7 @@ python tools/inspect_vggt_camera_motion.py \
 轨迹点本身可继续用原始视频投影工具检查：
 
 ```bash
-python tools/visualize_trajectory_video.py --help
+python tools/visualization/visualize_trajectory_video.py --help
 ```
 
 ## 2. 缓存冻结的 VGGT 特征
@@ -101,13 +104,13 @@ python tools/visualize_trajectory_video.py --help
 1B backbone 不参与常规 tokenizer 反向；先分别缓存 train/val：
 
 ```bash
-python tools/cache_vggt_omega_features.py \
+python tools/features/cache_vggt_omega_features.py \
   --config configs/nuscenes_vggt_omega_front_4s.yaml \
   --manifest data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
   --output data/vggt_omega_cache/nuscenes_front_4s_train \
   --shard-size 128 --num-workers 2
 
-python tools/cache_vggt_omega_features.py \
+python tools/features/cache_vggt_omega_features.py \
   --config configs/nuscenes_vggt_omega_front_4s.yaml \
   --manifest data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl \
   --output data/vggt_omega_cache/nuscenes_front_4s_val \
@@ -124,7 +127,7 @@ python tools/cache_vggt_omega_features.py \
 
 ```bash
 torchrun --standalone --nproc_per_node=1 \
-  tools/train_tokenizer.py \
+  tools/training/train_tokenizer.py \
   --config configs/nuscenes_vggt_omega_front_4s.yaml \
   --train-manifest data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
   --val-manifest data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl \
@@ -160,7 +163,7 @@ V1 在 epoch 161 达到最佳 val ADE `0.343 m`，随后训练到 500 epoch 只�
 
 ```bash
 torchrun --standalone --nproc_per_node=1 \
-  tools/train_tokenizer.py \
+  tools/training/train_tokenizer.py \
   --config configs/nuscenes_vggt_omega_front_4s_v2_motion.yaml \
   --train-manifest data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
   --val-manifest data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl \
@@ -176,7 +179,7 @@ Rich attention 实验未超过 motion，并发现多个 learned query 塌缩。V
 
 ```bash
 torchrun --standalone --nproc_per_node=1 \
-  tools/train_tokenizer.py \
+  tools/training/train_tokenizer.py \
   --config configs/nuscenes_vggt_omega_front_4s_v3_residual_register.yaml \
   --train-manifest data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
   --val-manifest data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl \
@@ -197,7 +200,7 @@ V3/V3-dynamics 均确认零 gate 令 register adapter 冷启动。修正后的�
 
 ```bash
 torchrun --standalone --nproc_per_node=1 \
-  tools/train_tokenizer.py \
+  tools/training/train_tokenizer.py \
   --config configs/nuscenes_vggt_omega_front_4s_v3_1_zero_init_residual.yaml \
   --train-manifest data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
   --val-manifest data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl \
@@ -207,7 +210,7 @@ torchrun --standalone --nproc_per_node=1 \
 训练后可用固定 `0.5` 系数生成单模型权重平均候选，再用完整 evaluator 判断是否保留：
 
 ```bash
-python tools/interpolate_tokenizer_checkpoints.py \
+python tools/analysis/interpolate_tokenizer_checkpoints.py \
   --left output/itae_vggt_omega_v3_1_zero_init_residual/initial.pt \
   --right output/itae_vggt_omega_v3_1_zero_init_residual/best_trained.pt \
   --alpha 0.5 \
@@ -223,7 +226,7 @@ token 为 `128-D motion + 64-D residual = 192-D`，仍可仅靠 token 和时间�
 
 ```bash
 torchrun --standalone --nproc_per_node=1 \
-  tools/train_tokenizer.py \
+  tools/training/train_tokenizer.py \
   --config configs/nuscenes_vggt_omega_front_4s_v4_output_residual.yaml \
   --train-manifest data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
   --val-manifest data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl \
@@ -237,7 +240,7 @@ register+pose 的 error gap。训练后用同一 evaluator 自动完成冻结 mo
 单独打乱 pose 和同时错配两者的消融：
 
 ```bash
-python tools/evaluate_tokenizer.py \
+python tools/evaluation/evaluate_tokenizer.py \
   --config configs/nuscenes_vggt_omega_front_4s_v4_output_residual.yaml \
   --manifest data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl \
   --checkpoint output/itae_vggt_omega_v4_output_residual/best_trained.pt \
@@ -248,7 +251,7 @@ python tools/evaluate_tokenizer.py \
 ## 4. 评估与 action latent 导出
 
 ```bash
-python tools/evaluate_tokenizer.py \
+python tools/evaluation/evaluate_tokenizer.py \
   --config configs/nuscenes_vggt_omega_front_4s.yaml \
   --manifest data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl \
   --train-manifest data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
@@ -256,7 +259,7 @@ python tools/evaluate_tokenizer.py \
   --checkpoint output/itae_vggt_omega_v1/best.pt \
   --output output/itae_vggt_omega_v1/val_metrics.json
 
-python tools/export_action_latents.py \
+python tools/features/export_action_latents.py \
   --config configs/nuscenes_vggt_omega_front_4s.yaml \
   --manifest data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
   --checkpoint output/itae_vggt_omega_v1/best.pt \

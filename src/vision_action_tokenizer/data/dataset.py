@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable
+from bisect import bisect_right
+from collections.abc import Callable, Mapping
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -14,6 +16,7 @@ from torch import Tensor
 from torch.utils.data import Dataset
 
 from .manifest import WindowRecord, load_manifest
+from .trajectory import shift_se2_reference_point
 
 
 class VGGTOmegaResize:
@@ -75,8 +78,34 @@ class VGGTOmegaResize:
 Sample = dict[str, Tensor | str]
 
 
-class NuScenesWindowDataset(Dataset[Sample]):
-    """Load images and a local `[T,3]` trajectory from a manifest.
+def configured_reference_point_offset(
+    config: dict[str, Any], windows: list[WindowRecord]
+) -> tuple[float, float]:
+    """Resolve one dataset-specific reference offset for a manifest."""
+    source_config = config.get("data", {}).get("sources")
+    if not source_config:
+        return (0.0, 0.0)
+    dataset_names = {window.dataset_name for window in windows}
+    if not dataset_names:
+        raise ValueError("Cannot resolve a reference-point offset for an empty manifest")
+    if len(dataset_names) != 1:
+        raise ValueError(
+            "A manifest must contain one dataset when resolving a reference-point offset"
+        )
+    dataset_name = next(iter(dataset_names))
+    values = source_config.get(dataset_name, {}).get(
+        "reference_point_offset_m", [0.0, 0.0]
+    )
+    offset = tuple(map(float, values))
+    if len(offset) != 2 or not np.isfinite(offset).all():
+        raise ValueError(
+            f"{dataset_name}.reference_point_offset_m must contain two finite values"
+        )
+    return offset
+
+
+class ActionWindowDataset(Dataset[Sample]):
+    """Load images and a local `[T,3]` trajectory from a dataset-neutral manifest.
 
     All trajectories use meters/radians in the anchor ego frame. `trajectory_mask`
     is `[T]` and is currently all true; it remains explicit for future variable-length data.
@@ -88,17 +117,23 @@ class NuScenesWindowDataset(Dataset[Sample]):
         image_size: int = 512,
         transform: Callable[[Image.Image], Tensor] | None = None,
         load_images: bool = True,
+        reference_point_offset_m: tuple[float, float] = (0.0, 0.0),
     ) -> None:
         self.windows = load_manifest(manifest) if isinstance(manifest, (str, Path)) else manifest
         self.transform = transform or VGGTOmegaResize(image_resolution=image_size)
         self.load_images = load_images
+        self.reference_point_offset_m = tuple(map(float, reference_point_offset_m))
+        if len(self.reference_point_offset_m) != 2:
+            raise ValueError("reference_point_offset_m must contain [x, y]")
 
     def __len__(self) -> int:
         return len(self.windows)
 
     def __getitem__(self, index: int) -> dict[str, Tensor | str]:
         window = self.windows[index]
-        trajectory = torch.tensor(window.trajectory, dtype=torch.float32)
+        trajectory = torch.from_numpy(
+            shift_se2_reference_point(window.trajectory, self.reference_point_offset_m)
+        )
         sample: dict[str, Tensor | str] = {
             "trajectory": trajectory,
             "trajectory_mask": torch.ones(trajectory.shape[0], dtype=torch.bool),
@@ -106,6 +141,8 @@ class NuScenesWindowDataset(Dataset[Sample]):
             "future_times": torch.tensor(window.future_times_s, dtype=torch.float32),
             "sample_token": window.sample_token,
             "scene_token": window.scene_token,
+            "group_token": window.group_token or window.scene_token,
+            "dataset_name": window.dataset_name,
             "image_paths_json": json.dumps(window.image_paths, ensure_ascii=False),
         }
         if self.load_images:
@@ -117,12 +154,62 @@ class NuScenesWindowDataset(Dataset[Sample]):
         return sample
 
 
+# Backward-compatible name used by existing downstream code and old imports.
+NuScenesWindowDataset = ActionWindowDataset
+
+
+class MultiSourceActionDataset(Dataset[Sample]):
+    """Concatenate source datasets while preserving an explicit source identity."""
+
+    def __init__(self, sources: Mapping[str, Dataset[Sample]]) -> None:
+        if not sources:
+            raise ValueError("At least one action dataset source is required")
+        self.sources = dict(sources)
+        if any(not name or "/" in name for name in self.sources):
+            raise ValueError("Dataset source names must be non-empty TensorBoard-safe labels")
+        self.source_names = list(self.sources)
+        self.cumulative_sizes: list[int] = []
+        total = 0
+        for dataset in self.sources.values():
+            if len(dataset) == 0:
+                raise ValueError("Action dataset sources must not be empty")
+            total += len(dataset)
+            self.cumulative_sizes.append(total)
+
+    def __len__(self) -> int:
+        return self.cumulative_sizes[-1]
+
+    def source_and_local_index(self, index: int) -> tuple[str, int]:
+        if index < 0:
+            index += len(self)
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        source_index = bisect_right(self.cumulative_sizes, index)
+        previous = 0 if source_index == 0 else self.cumulative_sizes[source_index - 1]
+        return self.source_names[source_index], index - previous
+
+    def __getitem__(self, index: int) -> Sample:
+        source_name, local_index = self.source_and_local_index(index)
+        sample = dict(self.sources[source_name][local_index])
+        sample["dataset_name"] = source_name
+        return sample
+
+    @property
+    def source_ranges(self) -> dict[str, range]:
+        ranges: dict[str, range] = {}
+        start = 0
+        for name, end in zip(self.source_names, self.cumulative_sizes, strict=True):
+            ranges[name] = range(start, end)
+            start = end
+        return ranges
+
+
 class CachedVGGTOmegaFeatureDataset(Dataset[Sample]):
     """Attach strict cached CameraHead hidden tokens to a trajectory sample."""
 
     def __init__(
         self,
-        base: NuScenesWindowDataset,
+        base: ActionWindowDataset,
         cache_directory: str | Path,
         manifest_path: str | Path | None = None,
         expected_metadata: dict[str, object] | None = None,

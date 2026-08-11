@@ -13,8 +13,9 @@ from torch.utils.data import DataLoader, Subset
 
 from vision_action_tokenizer.config import load_config, stable_hash
 from vision_action_tokenizer.data.dataset import (
+    ActionWindowDataset,
     CachedVGGTOmegaFeatureDataset,
-    NuScenesWindowDataset,
+    configured_reference_point_offset,
 )
 from vision_action_tokenizer.data.manifest import load_manifest
 from vision_action_tokenizer.data.planner_dataset import file_sha256
@@ -42,7 +43,14 @@ def main() -> None:
     config = load_config(args.tokenizer_config)
     backbone = config["vision_backbone"]
     source_manifest = args.source_manifest or args.manifest
-    base = NuScenesWindowDataset(source_manifest, load_images=False)
+    source_windows = load_manifest(source_manifest)
+    base = ActionWindowDataset(
+        source_windows,
+        load_images=False,
+        reference_point_offset_m=configured_reference_point_offset(
+            config, source_windows
+        ),
+    )
     source_dataset = CachedVGGTOmegaFeatureDataset(
         base,
         args.feature_cache,

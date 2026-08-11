@@ -13,13 +13,36 @@ import torch
 import yaml
 
 
-def load_config(path: str | Path) -> dict[str, Any]:
-    """Load a YAML config and fail early when the top-level type is invalid."""
-    with Path(path).open("r", encoding="utf-8") as handle:
+def _merge_config(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    result = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _merge_config(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def load_config(path: str | Path, _seen: set[Path] | None = None) -> dict[str, Any]:
+    """Load YAML with an optional relative ``_base_`` config and deep overrides."""
+    config_path = Path(path).resolve()
+    seen = set() if _seen is None else set(_seen)
+    if config_path in seen:
+        raise ValueError(f"Recursive config inheritance detected at {config_path}")
+    seen.add(config_path)
+    with config_path.open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
     if not isinstance(config, dict):
         raise ValueError(f"Expected a mapping in config {path}, got {type(config).__name__}")
-    return config
+    base_path = config.pop("_base_", None)
+    if base_path is None:
+        return config
+    if not isinstance(base_path, (str, Path)):
+        raise TypeError("_base_ must be a relative or absolute YAML path")
+    resolved_base = Path(base_path)
+    if not resolved_base.is_absolute():
+        resolved_base = config_path.parent / resolved_base
+    return _merge_config(load_config(resolved_base, seen), config)
 
 
 def stable_hash(value: Any) -> str:
@@ -58,7 +81,7 @@ def resolve_resume_checkpoint(
     if not isinstance(setting, (str, Path)):
         raise TypeError("train.resume must be auto/latest, null/false/none, or a path")
     normalized = str(setting).strip()
-    if normalized.lower() in {"", "none", "off", "false"}:
+    if normalized.lower() in {"", "none", "never", "off", "false"}:
         return None
     if normalized.lower() in {"auto", "latest"}:
         last_checkpoint = output / "last.pt"

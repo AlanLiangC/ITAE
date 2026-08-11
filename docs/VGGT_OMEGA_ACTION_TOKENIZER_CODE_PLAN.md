@@ -166,7 +166,7 @@ trajectory_mask [B,40]
 
 ## 5. 先做几何可用性审计
 
-在训练 tokenizer 前新增 `tools/inspect_vggt_camera_motion.py`，对 train/val 各抽取直行、静止、
+在训练 tokenizer 前新增 `tools/analysis/inspect_vggt_camera_motion.py`，对 train/val 各抽取直行、静止、
 转弯和长距离样本，执行：
 
 1. 从 `pose_enc` 解码 `camera-from-world` extrinsics；
@@ -275,7 +275,7 @@ mean baseline 后，再逐项加入速度/jerk 正则，不能一次叠加全部
 
 ## 9. 特征缓存
 
-新增 `tools/cache_vggt_omega_features.py`，默认缓存 CameraHead trunk 后的：
+新增 `tools/features/cache_vggt_omega_features.py`，默认缓存 CameraHead trunk 后的：
 
 ```text
 camera_hidden          [5,2048] fp16
@@ -415,10 +415,10 @@ train:
 | `src/.../models/factory.py` | 只构建 VGGT 新图，不再在主配置兼容 PE 架构 |
 | `src/.../losses.py` | 改为 trajectory/increment/keyframe/yaw 四项主损失 |
 | `src/.../data/dataset.py` | 增加严格 VGGT cache dataset 和 metadata 校验 |
-| `tools/inspect_vggt_camera_motion.py` | 新增 camera motion 几何审计和可视化 |
-| `tools/cache_vggt_omega_features.py` | 新增离线 feature cache |
-| `tools/train_tokenizer.py` | 默认要求 VGGT cache；online 仅用于 smoke/fine-tune |
-| `tools/evaluate_tokenizer.py` | 增加 bucket、keyframe、increment baseline 指标 |
+| `tools/analysis/inspect_vggt_camera_motion.py` | 新增 camera motion 几何审计和可视化 |
+| `tools/features/cache_vggt_omega_features.py` | 新增离线 feature cache |
+| `tools/training/train_tokenizer.py` | 默认要求 VGGT cache；online 仅用于 smoke/fine-tune |
+| `tools/evaluation/evaluate_tokenizer.py` | 增加 bucket、keyframe、increment baseline 指标 |
 | `src/.../visualization.py` | 调整 2×2 第四格为 increment/error diagnostics |
 | `configs/nuscenes_vggt_omega_front_4s.yaml` | 新建唯一正式配置 |
 | `.vscode/launch.json` | 增加 probe/cache/train 三个 debug entry |

@@ -280,7 +280,7 @@ TensorBoard 使用相同固定 sample token、相同评测 seed：
 - train/val flow loss（raw 与 token 分开看）；
 - decoded ADE/FDE、收敛 AUC、LR、gradient norm、EMA/non-EMA 差异；
 - 当前主视图以及 BEV 中 GT/raw/token/oracle-token 四条轨迹；
-- 复用 `tools/visualize_trajectory_video.py` 的轨迹配色，输出 2×2 图或短视频；
+- 复用 `tools/visualization/visualize_trajectory_video.py` 的轨迹配色，输出 2×2 图或短视频；
 - 失败样本按 FDE、turn、accelerating 等分类，避免只展示手选成功案例。
 
 比较工具输出机器可读 `comparison.json`、逐样本预测文件和 Markdown summary，报告 config/hash、
@@ -298,12 +298,12 @@ src/vision_action_tokenizer/models/flow_planner.py
 src/vision_action_tokenizer/flow_matching.py
 src/vision_action_tokenizer/planner_evaluator.py
 
-tools/split_planner_manifests.py
-tools/cache_planner_vision_features.py
-tools/cache_tokenizer_action_targets.py
-tools/train_flow_planner.py
-tools/evaluate_flow_planner.py
-tools/compare_flow_planners.py
+tools/data/split_planner_manifests.py
+tools/features/cache_planner_vision_features.py
+tools/features/cache_tokenizer_action_targets.py
+tools/training/train_flow_planner.py
+tools/evaluation/evaluate_flow_planner.py
+tools/evaluation/compare_flow_planners.py
 
 configs/planner/nuscenes_flow_raw_4s.yaml
 configs/planner/nuscenes_flow_token_v4_4s.yaml

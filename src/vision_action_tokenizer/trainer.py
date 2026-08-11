@@ -20,6 +20,7 @@ from .data.dataset import VGGTOmegaResize
 from .distributed import DistributedContext
 from .losses import TokenizerLoss
 from .metrics import trajectory_metrics
+from .models.tokenizer import TokenizerOutput
 from .visualization import render_vggt_evaluation_diagnostic
 
 
@@ -45,6 +46,44 @@ def _checkpoint_model_state(model: nn.Module) -> dict[str, Tensor]:
             if not key.startswith("feature_extractor.model.")
         }
     return state
+
+
+def _validate_multi_source_resume_config(
+    current: dict[str, Any], saved: dict[str, Any]
+) -> None:
+    """Reject structurally compatible checkpoints from a different joint run."""
+    if not current.get("data", {}).get("sources"):
+        return
+    sections = {
+        "action_tokenizer": (
+            current.get("action_tokenizer"),
+            saved.get("action_tokenizer"),
+        ),
+        "loss": (current.get("loss"), saved.get("loss")),
+        "data.sources": (
+            current.get("data", {}).get("sources"),
+            saved.get("data", {}).get("sources"),
+        ),
+        "data.sampling": (
+            current.get("data", {}).get("sampling"),
+            saved.get("data", {}).get("sampling"),
+        ),
+        "data_runtime.sources": (
+            current.get("data_runtime", {}).get("sources"),
+            saved.get("data_runtime", {}).get("sources"),
+        ),
+    }
+    mismatches = [name for name, (left, right) in sections.items() if left != right]
+    current_backbone = current.get("vision_backbone", {})
+    saved_backbone = saved.get("vision_backbone", {})
+    for key in ("checkpoint_sha256", "cache_token_mode", "feature_dim"):
+        if current_backbone.get(key) != saved_backbone.get(key):
+            mismatches.append(f"vision_backbone.{key}")
+    if mismatches:
+        raise ValueError(
+            "Joint resume checkpoint provenance/config mismatch: "
+            + ", ".join(mismatches)
+        )
 
 
 def is_visual_residual_parameter(name: str) -> bool:
@@ -85,6 +124,15 @@ def _model_diagnostics(model: nn.Module) -> dict[str, Tensor]:
     }
 
 
+def _slice_output(output: TokenizerOutput, selection: Tensor) -> TokenizerOutput:
+    return TokenizerOutput(
+        **{
+            name: None if value is None else value[selection]
+            for name, value in vars(output).items()
+        }
+    )
+
+
 def _load_camera_window(paths_json: str, config: dict[str, Any]) -> Tensor:
     paths = json.loads(paths_json)
     backbone = config["vision_backbone"]
@@ -98,6 +146,40 @@ def _load_camera_window(paths_json: str, config: dict[str, Any]) -> Tensor:
         with Image.open(path) as image:
             frames.append(transform(image))
     return torch.stack(frames)
+
+
+def _trajectory_sampling_labels(
+    trajectory: Tensor,
+    future_times: Tensor,
+    *,
+    steps_per_interval: int,
+    speed_trend_threshold_mps: float,
+) -> tuple[str, str]:
+    """Classify one sampled trajectory for source-sampler diagnostics."""
+    endpoint = trajectory[-1]
+    distance = float(torch.linalg.vector_norm(endpoint[:2]))
+    if distance < 2.0:
+        return "stationary", "stationary"
+    motion = (
+        "turn"
+        if abs(float(endpoint[1])) > 2.0 or abs(float(endpoint[2])) > 0.15
+        else ("straight_slow" if distance < 20.0 else "straight_fast")
+    )
+    previous_xy = torch.cat(
+        [torch.zeros_like(trajectory[:1, :2]), trajectory[:-1, :2]], dim=0
+    )
+    delta_t = torch.diff(torch.cat([torch.zeros_like(future_times[:1]), future_times]))
+    speed = torch.linalg.vector_norm(trajectory[:, :2] - previous_xy, dim=-1) / delta_t
+    change = float(
+        speed[-steps_per_interval:].mean() - speed[:steps_per_interval].mean()
+    )
+    if change > speed_trend_threshold_mps:
+        trend = "accelerating"
+    elif change < -speed_trend_threshold_mps:
+        trend = "decelerating"
+    else:
+        trend = "steady"
+    return motion, trend
 
 
 class TokenizerTrainer:
@@ -130,6 +212,9 @@ class TokenizerTrainer:
         self.best_ade = math.inf
         self.best_trained_ade = math.inf
         train_config = self.config.get("train", {})
+        self.checkpoint_metric = str(
+            train_config.get("checkpoint_metric", "metric/ade_m")
+        )
         self.validation_precision = str(
             train_config.get("validation_precision", precision)
         )
@@ -168,6 +253,9 @@ class TokenizerTrainer:
         self.eval_visualization_items = int(
             tensorboard_config.get("evaluation_visualization_items", 0)
         )
+        self.eval_visualization_items_per_source = int(
+            tensorboard_config.get("evaluation_visualization_items_per_source", 0)
+        )
         self.eval_visualization_every = int(
             tensorboard_config.get("evaluation_visualization_every_epochs", 1)
         )
@@ -179,6 +267,10 @@ class TokenizerTrainer:
         )
         if self.eval_visualization_items < 0:
             raise ValueError("tensorboard.evaluation_visualization_items must be non-negative")
+        if self.eval_visualization_items_per_source < 0:
+            raise ValueError(
+                "tensorboard.evaluation_visualization_items_per_source must be non-negative"
+            )
         if self.eval_visualization_every <= 0:
             raise ValueError(
                 "tensorboard.evaluation_visualization_every_epochs must be positive"
@@ -228,7 +320,11 @@ class TokenizerTrainer:
                     sampler.set_epoch(epoch)
                 self._train_epoch(train_loader, epoch, log_every)
                 metrics = self.evaluate(val_loader, epoch=epoch)
-                ade = float(metrics.get("metric/ade_m", torch.tensor(math.inf)))
+                if self.checkpoint_metric not in metrics:
+                    raise KeyError(
+                        f"Configured checkpoint metric is missing: {self.checkpoint_metric}"
+                    )
+                ade = float(metrics[self.checkpoint_metric])
                 is_best = ade < self.best_ade - self.early_stopping_min_delta
                 if is_best:
                     self.best_ade = ade
@@ -344,6 +440,10 @@ class TokenizerTrainer:
                 if "residual" in name:
                     module.train()
         running: dict[str, float] = defaultdict(float)
+        source_seen: dict[str, int] = defaultdict(int)
+        motion_seen: dict[str, int] = defaultdict(int)
+        trend_seen: dict[str, int] = defaultdict(int)
+        total_seen = 0
         for batch_index, raw_batch in enumerate(loader):
             batch = _to_device(raw_batch, self.context.device)
             self.optimizer.zero_grad(set_to_none=True)
@@ -373,6 +473,23 @@ class TokenizerTrainer:
             if self.scheduler is not None:
                 self.scheduler.step()
             self.global_step += 1
+            for source_name in raw_batch.get("dataset_name", []):
+                source_seen[str(source_name)] += 1
+                total_seen += 1
+            balancing = self.config.get("train", {}).get("motion_balancing", {})
+            steps_per_interval = int(self.config["action_tokenizer"]["steps_per_token"])
+            trend_threshold = float(balancing.get("speed_trend_threshold_mps", 0.5))
+            for trajectory, future_times in zip(
+                raw_batch["trajectory"], raw_batch["future_times"], strict=True
+            ):
+                motion, trend = _trajectory_sampling_labels(
+                    trajectory,
+                    future_times,
+                    steps_per_interval=steps_per_interval,
+                    speed_trend_threshold_mps=trend_threshold,
+                )
+                motion_seen[motion] += 1
+                trend_seen[trend] += 1
             for key, value in terms.items():
                 running[key] += float(value)
             if self.context.is_main:
@@ -383,6 +500,10 @@ class TokenizerTrainer:
                     step_metrics[f"optimization/lr_{group_name}"] = group["lr"]
                 step_metrics["optimization/grad_norm"] = grad_norm.detach()
                 step_metrics["progress/base_frozen"] = float(bool(self._base_frozen))
+                for source_name, count in source_seen.items():
+                    step_metrics[f"sampling/source_{source_name}_fraction"] = (
+                        count / max(total_seen, 1)
+                    )
                 self._write_scalars("train", step_metrics, self.global_step)
             if self.context.is_main and (batch_index + 1) % log_every == 0:
                 averaged = {key: value / log_every for key, value in running.items()}
@@ -390,12 +511,47 @@ class TokenizerTrainer:
                 self._print_metrics(f"train epoch={epoch} step={self.global_step}", averaged)
                 running.clear()
 
+        labels = {
+            "source": sorted(self.config.get("data", {}).get("sources", source_seen)),
+            "motion": ["stationary", "straight_slow", "straight_fast", "turn"],
+            "speed_trend": ["stationary", "steady", "accelerating", "decelerating"],
+        }
+        observed = {"source": source_seen, "motion": motion_seen, "speed_trend": trend_seen}
+        sampling_metrics: dict[str, float] = {}
+        for family, names in labels.items():
+            counts = torch.tensor(
+                [observed[family][name] for name in names],
+                dtype=torch.float64,
+                device=self.context.device,
+            )
+            if self.context.world_size > 1:
+                dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+            denominator = float(counts.sum().clamp_min(1.0))
+            for name, count in zip(names, counts.tolist(), strict=True):
+                sampling_metrics[f"sampling/actual_{family}_{name}_fraction"] = (
+                    count / denominator
+                )
+        expectations = self.config.get("data_runtime", {}).get(
+            "sampling_expectation", {}
+        )
+        for family, values in expectations.items():
+            for name, value in values.items():
+                sampling_metrics[f"sampling/expected_{family}_{name}_fraction"] = float(
+                    value
+                )
+        if self.context.is_main:
+            self._write_scalars("train", sampling_metrics, self.global_step)
+            self._print_metrics(f"sampling epoch={epoch}", sampling_metrics)
+
     @torch.no_grad()
     def evaluate(self, loader: Any, epoch: int | None = None) -> dict[str, Tensor]:
         self.model.eval()
         totals: dict[str, Tensor] = {}
+        source_totals: dict[str, dict[str, Tensor]] = defaultdict(dict)
+        source_counts: dict[str, int] = defaultdict(int)
         sample_count = 0
         visualization_count = 0
+        source_visualization_counts: dict[str, int] = defaultdict(int)
         visualized_scenes: set[str] = set()
         render_visualizations = (
             self.writer is not None
@@ -428,14 +584,62 @@ class TokenizerTrainer:
                         ),
                     )
                 )
+                dataset_names = [str(name) for name in batch.get("dataset_name", [])]
+                for source_name in sorted(set(dataset_names)):
+                    selection = torch.tensor(
+                        [name == source_name for name in dataset_names],
+                        device=self.context.device,
+                        dtype=torch.bool,
+                    )
+                    source_output = _slice_output(output, selection)
+                    source_shuffled = (
+                        None
+                        if shuffled_output is None
+                        else _slice_output(shuffled_output, selection)
+                    )
+                    _, source_terms = self.loss_module(
+                        source_output,
+                        batch["trajectory"][selection],
+                        batch["future_times"][selection],
+                        batch["trajectory_mask"][selection],
+                        self.global_step,
+                        shuffled_output=source_shuffled,
+                    )
+                    source_terms.update(
+                        trajectory_metrics(
+                            source_output.reconstruction,
+                            batch["trajectory"][selection],
+                            batch["future_times"][selection],
+                            batch["trajectory_mask"][selection],
+                            steps_per_token=int(
+                                self.config["action_tokenizer"]["steps_per_token"]
+                            ),
+                        )
+                    )
+                    source_count = int(selection.sum())
+                    source_counts[source_name] += source_count
+                    for key, value in source_terms.items():
+                        weighted = value.detach().float() * source_count
+                        current = source_totals[source_name].get(key)
+                        source_totals[source_name][key] = (
+                            weighted if current is None else current + weighted
+                        )
             if render_visualizations and visualization_count < self.eval_visualization_items:
                 batch_size = batch["trajectory"].shape[0]
                 sample_tokens = batch.get("sample_token", [""] * batch_size)
                 scene_tokens = batch.get("scene_token", [""] * batch_size)
+                dataset_names = batch.get("dataset_name", ["dataset"] * batch_size)
                 for item_index in range(batch_size):
                     if visualization_count >= self.eval_visualization_items:
                         break
                     scene_token = str(scene_tokens[item_index])
+                    source_name = str(dataset_names[item_index])
+                    if (
+                        self.eval_visualization_items_per_source > 0
+                        and source_visualization_counts[source_name]
+                        >= self.eval_visualization_items_per_source
+                    ):
+                        continue
                     if (
                         self.eval_visualization_distinct_scenes
                         and scene_token in visualized_scenes
@@ -461,25 +665,87 @@ class TokenizerTrainer:
                     )
                     assert self.writer is not None
                     self.writer.add_image(
-                        f"evaluation/vggt_diagnostic_2x2/item_{visualization_count:03d}",
+                        f"evaluation/{source_name}/vggt_diagnostic_2x2/"
+                        f"item_{source_visualization_counts[source_name]:03d}",
                         image,
                         self.global_step,
                     )
                     visualized_scenes.add(scene_token)
                     visualization_count += 1
+                    source_visualization_counts[source_name] += 1
             batch_size = int(batch["trajectory"].shape[0])
             for key, value in terms.items():
                 weighted = value.detach().float() * batch_size
                 totals[key] = totals.get(key, torch.zeros_like(weighted)) + weighted
             sample_count += batch_size
-        return _reduce_sample_weighted_metrics(
+        metrics = _reduce_sample_weighted_metrics(
             totals, sample_count, self.context.world_size
         )
+        configured_sources = list(self.config.get("data", {}).get("sources", {}))
+        all_sources = sorted(set(configured_sources) | set(source_counts))
+        source_metrics: dict[str, dict[str, Tensor]] = {}
+        for source_name in all_sources:
+            current_totals = source_totals[source_name]
+            device = self.context.device
+            count = torch.tensor(float(source_counts[source_name]), device=device)
+            if self.context.world_size > 1:
+                dist.all_reduce(count, op=dist.ReduceOp.SUM)
+            reduced_source_totals: dict[str, Tensor] = {}
+            for key in sorted(totals):
+                value = current_totals.get(key, torch.zeros_like(totals[key]))
+                if self.context.world_size > 1:
+                    dist.all_reduce(value, op=dist.ReduceOp.SUM)
+                reduced_source_totals[key] = value
+            if count.item() <= 0:
+                continue
+            averaged = {
+                key: value / count for key, value in reduced_source_totals.items()
+            }
+            source_metrics[source_name] = averaged
+            metrics.update(
+                {f"source/{source_name}/{key}": value for key, value in averaged.items()}
+            )
+        if source_metrics:
+            shared_keys = set.intersection(
+                *(set(values) for values in source_metrics.values())
+            )
+            sampling = self.config.get("data", {}).get("sampling", {})
+            strategy = str(sampling.get("strategy", "proportional"))
+            configured_weights = sampling.get("source_weights", {})
+            if strategy == "balanced":
+                weights = {source_name: 1.0 for source_name in source_metrics}
+            elif strategy == "weighted":
+                weights = {
+                    source_name: float(configured_weights[source_name])
+                    for source_name in source_metrics
+                }
+            else:
+                runtime_sources = self.config.get("data_runtime", {}).get("sources", {})
+                weights = {
+                    source_name: float(
+                        runtime_sources.get(source_name, {}).get("num_train_windows", 1.0)
+                    )
+                    for source_name in source_metrics
+                }
+            weight_sum = sum(weights.values())
+            if weight_sum <= 0:
+                raise ValueError("Validation source weights must sum to a positive value")
+            for key in shared_keys:
+                metrics[f"macro/{key}"] = torch.stack(
+                    [values[key] for values in source_metrics.values()]
+                ).mean()
+                metrics[f"weighted/{key}"] = sum(
+                    source_metrics[source_name][key] * weights[source_name]
+                    for source_name in source_metrics
+                ) / weight_sum
+        return metrics
 
     def establish_initial_baseline(self, loader: Any) -> dict[str, Tensor]:
         """Measure a warm start with the current precision and aggregation contract."""
         metrics = self.evaluate(loader, epoch=-1)
-        ade = float(metrics.get("metric/ade_m", torch.tensor(math.inf)))
+        if self.checkpoint_metric not in metrics:
+            raise KeyError(f"Configured checkpoint metric is missing: {self.checkpoint_metric}")
+        ade = float(metrics[self.checkpoint_metric])
         if not math.isfinite(ade):
             raise ValueError("Initial validation ADE is not finite")
         self.best_ade = ade
@@ -516,6 +782,9 @@ class TokenizerTrainer:
 
     def load_checkpoint(self, path: str | Path, weights_only: bool = False) -> int:
         checkpoint = torch.load(path, map_location=self.context.device, weights_only=False)
+        _validate_multi_source_resume_config(
+            self.config, checkpoint.get("config", {})
+        )
         model = _unwrap(self.model)
         incompatible = model.load_state_dict(checkpoint["model"], strict=False)
         invalid_missing = [

@@ -32,6 +32,14 @@ class WindowRecord:
     max_trajectory_time_error_us: int
     ego_motion_states: list[list[float]] | None = None
     ego_motion_times_s: list[float] | None = None
+    dataset_name: str = "nuscenes"
+    group_token: str | None = None
+    coordinate_frame: str = "anchor_ego_x_forward_y_left"
+    reference_point: str = "native_ego"
+    native_trajectory_hz: float | None = None
+    native_trajectory: list[list[float]] | None = None
+    native_future_times_s: list[float] | None = None
+    schema_version: int = 1
 
 
 class ManifestBuilder:
@@ -337,6 +345,7 @@ class ManifestBuilder:
                         max_trajectory_time_error_us=max(current_trajectory_errors),
                         ego_motion_states=ego_motion_states,
                         ego_motion_times_s=ego_motion_times_s,
+                        schema_version=2,
                     )
                 )
 
@@ -497,3 +506,20 @@ def manifest_scene_tokens(path: str | Path) -> set[str]:
             except (KeyError, json.JSONDecodeError) as error:
                 raise ValueError(f"Invalid manifest line {line_number}: {error}") from error
     return scene_tokens
+
+
+def manifest_group_tokens(path: str | Path) -> set[str]:
+    """Read namespaced split groups, falling back to legacy scene tokens."""
+    groups: set[str] = set()
+    with Path(path).open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+                dataset = str(payload.get("dataset_name", "nuscenes"))
+                group = str(payload.get("group_token") or payload["scene_token"])
+                groups.add(group if ":" in group else f"{dataset}:{group}")
+            except (KeyError, json.JSONDecodeError) as error:
+                raise ValueError(f"Invalid manifest line {line_number}: {error}") from error
+    return groups

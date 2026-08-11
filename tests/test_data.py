@@ -12,7 +12,9 @@ from safetensors.torch import save_file
 from vggt_omega.utils.load_fn import load_and_preprocess_images
 
 from vision_action_tokenizer.data.dataset import (
+    ActionWindowDataset,
     CachedVGGTOmegaFeatureDataset,
+    MultiSourceActionDataset,
     NuScenesWindowDataset,
     VGGTOmegaResize,
 )
@@ -28,6 +30,7 @@ from vision_action_tokenizer.data.manifest import (
     manifest_scene_tokens,
     save_manifest,
 )
+from vision_action_tokenizer.data.sampler import DeterministicDistributedWeightedSampler
 from vision_action_tokenizer.data.schema import FrameRecord, InfoSchemaAdapter
 from vision_action_tokenizer.data.temporal import TemporalIndex
 
@@ -143,6 +146,51 @@ def test_vggt_rich_register_cache_returns_all_tokens(tmp_path: Path) -> None:
     (tmp_path / "index.json").write_text(json.dumps(index), encoding="utf-8")
     sample = CachedVGGTOmegaFeatureDataset(base, tmp_path)[0]
     assert sample["register_hidden"].shape == (5, 16, 8)
+
+
+def test_multi_source_dataset_tags_source_and_sampler_is_deterministic() -> None:
+    def record(token: str, dataset_name: str) -> WindowRecord:
+        return WindowRecord(
+            sample_token=token,
+            scene_token=f"scene-{token}",
+            anchor_timestamp_us=0,
+            image_paths=[],
+            image_timestamps_us=[],
+            frame_times_s=[0, 1, 2, 3, 4],
+            trajectory=[[0.0, 0.0, 0.0]] * 40,
+            future_times_s=[step / 10 for step in range(1, 41)],
+            max_image_time_error_us=0,
+            max_trajectory_time_error_us=0,
+            dataset_name=dataset_name,
+        )
+
+    dataset = MultiSourceActionDataset(
+        {
+            "nuscenes": ActionWindowDataset([record("nusc", "legacy")], load_images=False),
+            "navsim": ActionWindowDataset([record("nav", "navsim")], load_images=False),
+        }
+    )
+    assert dataset[0]["dataset_name"] == "nuscenes"
+    assert dataset[1]["dataset_name"] == "navsim"
+    sampler = DeterministicDistributedWeightedSampler(
+        [1.0, 3.0], num_samples=20, seed=7
+    )
+    sampler.set_epoch(2)
+    first = list(sampler)
+    sampler.set_epoch(2)
+    assert list(sampler) == first
+    sampler.set_epoch(3)
+    assert list(sampler) != first
+
+    rank_zero = DeterministicDistributedWeightedSampler(
+        [1.0, 3.0], num_samples=20, seed=7, num_replicas=2, rank=0
+    )
+    rank_one = DeterministicDistributedWeightedSampler(
+        [1.0, 3.0], num_samples=20, seed=7, num_replicas=2, rank=1
+    )
+    combined = [value for pair in zip(rank_zero, rank_one, strict=True) for value in pair]
+    single = DeterministicDistributedWeightedSampler([1.0, 3.0], num_samples=20, seed=7)
+    assert combined == list(single)
 
 
 def test_pose_interpolation_uses_shortest_rotation() -> None:

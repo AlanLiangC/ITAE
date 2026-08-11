@@ -1,0 +1,16 @@
+_base_: nuscenes_navsim_v4_scratch_4s_smoke.yaml
+
+data:
+  sampling:
+    samples_per_epoch: 4
+
+train:
+  epochs: 30
+  batch_size: 4
+  learning_rate: 0.001
+  warmup_steps: 0
+  log_every: 100
+
+tensorboard:
+  enabled: false
+  evaluation_visualization_items: 0

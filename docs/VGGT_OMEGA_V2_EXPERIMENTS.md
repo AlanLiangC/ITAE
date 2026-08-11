@@ -29,13 +29,13 @@ V2 做了以下调整：
 ## 训练命令
 
 ```bash
-torchrun --standalone --nproc_per_node=1 tools/train_tokenizer.py \
+torchrun --standalone --nproc_per_node=1 tools/training/train_tokenizer.py \
   --config configs/nuscenes_vggt_omega_front_4s_v2_motion.yaml \
   --train-manifest data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
   --val-manifest data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl \
   --output output/itae_vggt_omega_v2_motion
 
-torchrun --standalone --nproc_per_node=1 tools/train_tokenizer.py \
+torchrun --standalone --nproc_per_node=1 tools/training/train_tokenizer.py \
   --config configs/nuscenes_vggt_omega_front_4s_v2_motion_large.yaml \
   --train-manifest data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
   --val-manifest data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl \
@@ -48,19 +48,19 @@ rich 配置会额外保存 `[5,16,2048]` 的 register hidden，预计 train+val 
 校验后断点续跑：
 
 ```bash
-python tools/cache_vggt_omega_features.py \
+python tools/features/cache_vggt_omega_features.py \
   --config configs/nuscenes_vggt_omega_front_4s_v2_rich_register.yaml \
   --manifest data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
   --output /home/alan/AlanLiang/Dataset/vggt_omega_cache/nuscenes_front_4s_train_rich \
   --shard-size 128 --num-workers 2
 
-python tools/cache_vggt_omega_features.py \
+python tools/features/cache_vggt_omega_features.py \
   --config configs/nuscenes_vggt_omega_front_4s_v2_rich_register.yaml \
   --manifest data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl \
   --output /home/alan/AlanLiang/Dataset/vggt_omega_cache/nuscenes_front_4s_val_rich \
   --shard-size 128 --num-workers 2
 
-torchrun --standalone --nproc_per_node=1 tools/train_tokenizer.py \
+torchrun --standalone --nproc_per_node=1 tools/training/train_tokenizer.py \
   --config configs/nuscenes_vggt_omega_front_4s_v2_rich_register.yaml \
   --train-manifest data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
   --val-manifest data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl \
@@ -69,7 +69,7 @@ torchrun --standalone --nproc_per_node=1 tools/train_tokenizer.py \
 
 ## 训练后需要比较
 
-用各自 config 和 `best.pt` 运行 `tools/evaluate_tokenizer.py`，重点保留：
+用各自 config 和 `best.pt` 运行 `tools/evaluation/evaluate_tokenizer.py`，重点保留：
 
 - overall ADE/FDE、keyframe ADE；
 - stationary / straight slow / straight fast / turn 的 ADE/FDE；
@@ -98,7 +98,7 @@ frame_geometry = frozen-compatible motion_mean_path
 推荐先跑严格结构消融：
 
 ```bash
-torchrun --standalone --nproc_per_node=1 tools/train_tokenizer.py \
+torchrun --standalone --nproc_per_node=1 tools/training/train_tokenizer.py \
   --config configs/nuscenes_vggt_omega_front_4s_v3_residual_register.yaml \
   --train-manifest data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
   --val-manifest data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl \
@@ -111,7 +111,7 @@ adapter 的 `0.1` 倍；新 output 已有 checkpoint 时优先正常 resume，�
 第二组仅用于判断速度趋势重采样的收益：
 
 ```bash
-torchrun --standalone --nproc_per_node=1 tools/train_tokenizer.py \
+torchrun --standalone --nproc_per_node=1 tools/training/train_tokenizer.py \
   --config configs/nuscenes_vggt_omega_front_4s_v3_residual_register_dynamics.yaml \
   --train-manifest data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
   --val-manifest data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl \
@@ -138,7 +138,7 @@ V3.1 用“零输出层”替代“零 gate”：
 - `resume: auto` 明确优先 `last.pt`，不会误选更新时间更晚的 best checkpoint。
 
 ```bash
-torchrun --standalone --nproc_per_node=1 tools/train_tokenizer.py \
+torchrun --standalone --nproc_per_node=1 tools/training/train_tokenizer.py \
   --config configs/nuscenes_vggt_omega_front_4s_v3_1_zero_init_residual.yaml \
   --train-manifest data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
   --val-manifest data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl \
@@ -151,7 +151,7 @@ register shuffle 消融中产生明确退化后，才值得重新引入加速/�
 如果 `best_trained.pt` 与初始化表现接近但误差互补，可生成预先固定的 0.5 权重 soup：
 
 ```bash
-python tools/interpolate_tokenizer_checkpoints.py \
+python tools/analysis/interpolate_tokenizer_checkpoints.py \
   --left output/itae_vggt_omega_v3_1_zero_init_residual/initial.pt \
   --right output/itae_vggt_omega_v3_1_zero_init_residual/best_trained.pt \
   --alpha 0.5 \
@@ -200,7 +200,7 @@ reconstruction     = integrate(base_increments + residual_increments)
 梯度/条件性验收，不代表 val 泛化结果。
 
 ```bash
-torchrun --standalone --nproc_per_node=1 tools/train_tokenizer.py \
+torchrun --standalone --nproc_per_node=1 tools/training/train_tokenizer.py \
   --config configs/nuscenes_vggt_omega_front_4s_v4_output_residual.yaml \
   --train-manifest data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl \
   --val-manifest data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl \

@@ -16,9 +16,10 @@ from vggt_omega.utils.pose_enc import encoding_to_camera
 
 from vision_action_tokenizer.config import load_config
 from vision_action_tokenizer.data.dataset import (
+    ActionWindowDataset,
     CachedVGGTOmegaFeatureDataset,
-    NuScenesWindowDataset,
     VGGTOmegaResize,
+    configured_reference_point_offset,
 )
 from vision_action_tokenizer.data.manifest import load_manifest
 from vision_action_tokenizer.metrics import trajectory_metrics
@@ -129,10 +130,13 @@ def main() -> None:
         mode=str(backbone["resize_mode"]),
         patch_size=int(backbone["patch_size"]),
     )
-    base = NuScenesWindowDataset(
-        args.manifest,
+    manifest_windows = load_manifest(args.manifest)
+    reference_offset = configured_reference_point_offset(config, manifest_windows)
+    base = ActionWindowDataset(
+        manifest_windows,
         transform=transform,
         load_images=cache is None,
+        reference_point_offset_m=reference_offset,
     )
     dataset = (
         base
@@ -170,8 +174,14 @@ def main() -> None:
         train_windows = load_manifest(args.train_manifest)
         if not train_windows:
             raise ValueError("--train-manifest is empty")
-        mean_trajectory = torch.tensor(
-            [window.trajectory for window in train_windows], dtype=torch.float32
+        train_offset = configured_reference_point_offset(config, train_windows)
+        train_dataset = ActionWindowDataset(
+            train_windows,
+            load_images=False,
+            reference_point_offset_m=train_offset,
+        )
+        mean_trajectory = torch.stack(
+            [train_dataset[index]["trajectory"] for index in range(len(train_dataset))]
         ).mean(dim=0).to(device)
     pose_scale = None
     if args.pose_calibration is not None:

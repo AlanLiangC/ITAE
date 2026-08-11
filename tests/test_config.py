@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from vision_action_tokenizer.config import resolve_resume_checkpoint
+from vision_action_tokenizer.config import load_config, resolve_resume_checkpoint
 
 
 def test_auto_resume_prefers_last_checkpoint(tmp_path: Path) -> None:
@@ -43,6 +43,15 @@ def test_resume_priority_and_fresh_override(tmp_path: Path) -> None:
 def test_auto_resume_starts_fresh_when_output_is_empty(tmp_path: Path) -> None:
     assert resolve_resume_checkpoint({"train": {"resume": "latest"}}, tmp_path) is None
     assert resolve_resume_checkpoint({"train": {"resume": None}}, tmp_path) is None
+    assert resolve_resume_checkpoint({"train": {"resume": "never"}}, tmp_path) is None
+
+
+def test_config_base_deep_merge(tmp_path: Path) -> None:
+    base = tmp_path / "base.yaml"
+    child = tmp_path / "child.yaml"
+    base.write_text("data:\n  value: 1\n  keep: 2\n", encoding="utf-8")
+    child.write_text("_base_: base.yaml\ndata:\n  value: 3\n", encoding="utf-8")
+    assert load_config(child) == {"data": {"value": 3, "keep": 2}}
 
 
 def test_explicit_missing_resume_checkpoint_fails(tmp_path: Path) -> None:

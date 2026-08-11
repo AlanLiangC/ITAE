@@ -1,0 +1,145 @@
+seed: 42
+
+data:
+  frame_offsets_s: [0.0, 1.0, 2.0, 3.0, 4.0]
+  future_horizon_s: 4.0
+  trajectory_hz: 10
+  num_workers: 4
+  sources:
+    nuscenes:
+      train_manifest: data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl
+      val_manifest: data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl
+      train_feature_cache: /home/alan/AlanLiang/Dataset/vggt_omega_cache/nuscenes_front_4s_train_rich
+      val_feature_cache: /home/alan/AlanLiang/Dataset/vggt_omega_cache/nuscenes_front_4s_val_rich
+      reference_point_offset_m: [0.0, 0.0]
+    navsim:
+      train_manifest: data/manifests/navsim_mini_train_4s.jsonl
+      val_manifest: data/manifests/navsim_mini_val_4s.jsonl
+      train_feature_cache: /home/alan/AlanLiang/Dataset/vggt_omega_cache/navsim_mini_front_4s_train_rich
+      val_feature_cache: /home/alan/AlanLiang/Dataset/vggt_omega_cache/navsim_mini_front_4s_val_rich
+      reference_point_offset_m: [0.0, 0.0]
+  sampling:
+    strategy: balanced
+    source_weights:
+      nuscenes: 0.2
+      navsim: 0.8
+    samples_per_epoch: null
+
+navsim_export:
+  data_root: /home/alan/AlanLiang/Dataset/navsim
+  split: mini
+  camera: CAM_F0
+  native_hz: 2
+  num_history_frames: 1
+  num_future_frames: 8
+  frame_interval: 1
+  visual_frame_indices: [0, 2, 4, 6, 8]
+  max_time_error_s: 0.06
+  has_route: true
+  split_unit: log
+  train_fraction: 0.8
+  split_seed: 42
+  interpolation: pdms_se2
+
+vision_backbone:
+  type: vggt_omega
+  source_path: third_party/vggt-omega
+  checkpoint_path: /home/alan/AlanLiang/Projects/pure_checkpoints/VGGT-Omega/vggt_omega_1b_512.pt
+  checkpoint_sha256: c02da418b18bb01d0392598d3f6147366bcde1bb70fd08a5e3bf7925b0667934
+  feature_dim: 2048
+  image_resolution: 512
+  resize_mode: max_size
+  patch_size: 16
+  freeze_aggregator: true
+  freeze_camera_trunk: true
+  cache_token_mode: camera_register_tokens
+  cache_dtype: float16
+
+action_tokenizer:
+  num_frames: 5
+  num_action_tokens: 4
+  action_token_dim: 192
+  motion_action_token_dim: 128
+  visual_residual_token_dim: 64
+  visual_residual_frame_dim: 128
+  visual_residual_register_dim: 32
+  visual_residual_max_forward_mps: 5.0
+  visual_residual_max_lateral_mps: 2.0
+  visual_residual_max_yaw_rate_rps: 0.5
+  frame_geometry_dim: 256
+  steps_per_token: 10
+  decoder_hidden_dim: 256
+  decoder_type: se2_increment
+  decoder_parameterization: velocity
+  initial_forward_speed_mps: 5.0
+  max_forward_speed_mps: 40.0
+  max_lateral_speed_mps: 8.0
+  max_yaw_rate_rps: 1.5
+  interval_mixer_layers: 2
+  interval_mixer_heads: 4
+  register_pooling: mean
+  register_token_count: 16
+  dropout: 0.0
+
+loss:
+  trajectory_weight: 1.0
+  increment_weight: 0.25
+  keyframe_weight: 0.75
+  yaw_weight: 0.1
+  body_velocity_weight: 0.1
+  yaw_rate_weight: 0.02
+  acceleration_weight: 0.002
+  jerk_weight: 0.00002
+  boundary_continuity_weight: 0.01
+  residual_velocity_weight: 0.25
+  residual_yaw_rate_weight: 0.02
+  residual_mean_weight: 0.01
+  residual_alignment_weight: 0.002
+  residual_alignment_temperature: 0.1
+  residual_alignment_warmup_steps: 3000
+  conditional_shuffle_weight: 0.1
+  conditional_shuffle_margin: 0.01
+  conditional_shuffle_warmup_steps: 500
+
+train:
+  # Scratch is intentional: no automatic discovery and no V2/V3/V4 warm start.
+  resume: auto
+  # initial_checkpoint: null
+  evaluate_initial_checkpoint: false
+  epochs: 300
+  batch_size: 32
+  learning_rate: 0.0001
+  freeze_base: false
+  freeze_base_epochs: 0
+  weight_decay: 0.01
+  warmup_steps: 1000
+  grad_clip_norm: 5.0
+  precision: bf16
+  validation_precision: fp32
+  log_every: 20
+  # early_stopping_patience: 30
+  # early_stopping_min_delta: 0.0001
+  checkpoint_metric: macro/metric/ade_m
+  motion_balancing:
+    enabled: true
+    bucket_weights:
+      stationary: 0.5
+      straight_slow: 1.0
+      straight_fast: 1.25
+      turn: 1.5
+    speed_trend_threshold_mps: 0.5
+    speed_trend_weights:
+      stationary: 1.0
+      steady: 1.0
+      accelerating: 1.0
+      decelerating: 1.0
+
+tensorboard:
+  enabled: true
+  log_dir: null
+  flush_secs: 30
+  evaluation_visualization_items: 8
+  evaluation_visualization_items_per_source: 4
+  evaluation_visualization_every_epochs: 5
+  evaluation_visualization_include_images: true
+  evaluation_visualization_distinct_scenes: true

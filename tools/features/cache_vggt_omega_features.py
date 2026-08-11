@@ -15,7 +15,7 @@ from safetensors.torch import save_file
 from torch.utils.data import DataLoader, Subset
 
 from vision_action_tokenizer.config import load_config, stable_hash
-from vision_action_tokenizer.data.dataset import NuScenesWindowDataset, VGGTOmegaResize
+from vision_action_tokenizer.data.dataset import ActionWindowDataset, VGGTOmegaResize
 from vision_action_tokenizer.models.vggt_omega import OmegaCameraFeatureExtractor, file_sha256
 
 
@@ -83,7 +83,7 @@ def main() -> None:
         mode=str(backbone["resize_mode"]),
         patch_size=int(backbone["patch_size"]),
     )
-    base = NuScenesWindowDataset(args.manifest, transform=transform, load_images=True)
+    base = ActionWindowDataset(args.manifest, transform=transform, load_images=True)
     sample_count = len(base) if args.max_samples is None else min(args.max_samples, len(base))
     checkpoint = Path(backbone["checkpoint_path"])
     checkpoint_sha = file_sha256(checkpoint)
@@ -93,6 +93,11 @@ def main() -> None:
     source_path = Path(backbone["source_path"])
     metadata: dict[str, object] = {
         "cache_type": "vggt_omega_camera_head_hidden_v1",
+        "dataset_names": sorted({window.dataset_name for window in base.windows}),
+        "manifest_schema_versions": sorted({window.schema_version for window in base.windows}),
+        "sample_token_order_sha256": stable_hash(
+            [window.sample_token for window in base.windows[:sample_count]]
+        ),
         "manifest_sha256": file_sha256(args.manifest),
         "checkpoint_path": str(checkpoint),
         "checkpoint_sha256": checkpoint_sha,
@@ -237,6 +242,20 @@ def main() -> None:
     with torch.inference_mode():
         for batch in loader:
             output = extractor(batch["images"].cuda(non_blocking=True))
+            actual_shapes = {
+                "camera_hidden": tuple(output.camera_hidden.shape[1:]),
+                "register_hidden_mean": tuple(output.register_hidden_mean.shape[1:]),
+                "pose_enc": tuple(output.pose_enc.shape[1:]),
+            }
+            if token_mode == "camera_register_tokens":
+                actual_shapes["register_hidden"] = tuple(output.register_hidden.shape[1:])
+            for key, actual_shape in actual_shapes.items():
+                expected_shape = tuple(metadata[f"{key}_shape"])
+                if actual_shape != expected_shape:
+                    raise ValueError(
+                        f"Extractor output shape mismatch for {key}: "
+                        f"{actual_shape} != {expected_shape}; check manifest frame count"
+                    )
             pending["camera_hidden"].append(output.camera_hidden.half().cpu())
             pending["register_hidden_mean"].append(
                 output.register_hidden_mean.half().cpu()

@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from tools.interpolate_tokenizer_checkpoints import interpolate_model_states
+from tools.analysis.interpolate_tokenizer_checkpoints import interpolate_model_states
 from vision_action_tokenizer.losses import LossConfig, TokenizerLoss, trajectory_xy_loss
 from vision_action_tokenizer.models.decoder import (
     ResidualVelocityDecoder,
@@ -16,7 +16,32 @@ from vision_action_tokenizer.models.tokenizer import (
     VisionActionTokenizer,
     pose_motion_features,
 )
-from vision_action_tokenizer.trainer import _reduce_sample_weighted_metrics
+from vision_action_tokenizer.trainer import (
+    _reduce_sample_weighted_metrics,
+    _validate_multi_source_resume_config,
+)
+
+
+def test_joint_resume_rejects_different_source_provenance() -> None:
+    current = {
+        "data": {"sources": {"navsim": {}}, "sampling": {"strategy": "balanced"}},
+        "data_runtime": {"sources": {"navsim": {"manifest": "new"}}},
+        "action_tokenizer": {"num_action_tokens": 4},
+        "loss": {"trajectory_weight": 1.0},
+        "vision_backbone": {
+            "checkpoint_sha256": "sha",
+            "cache_token_mode": "camera_register_tokens",
+            "feature_dim": 2048,
+        },
+    }
+    saved = {
+        **current,
+        "data_runtime": {"sources": {"navsim": {"manifest": "old"}}},
+    }
+    with pytest.raises(ValueError, match="provenance/config mismatch"):
+        _validate_multi_source_resume_config(current, saved)
+
+    _validate_multi_source_resume_config(current, current)
 
 
 def test_se2_increment_round_trip() -> None:
