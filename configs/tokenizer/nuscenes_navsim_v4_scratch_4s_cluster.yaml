@@ -1,0 +1,28 @@
+_base_: nuscenes_navsim_v4_scratch_4s.yaml
+
+# Paths for the current cluster workspace. Large generated caches remain under
+# data/vggt_omega_cache/, which is ignored by Git.
+data:
+  sources:
+    nuscenes:
+      train_manifest: data/manifests/nuscenes_lidar10hz_front_4s_train.jsonl
+      val_manifest: data/manifests/nuscenes_lidar10hz_front_4s_val.jsonl
+      train_feature_cache: data/vggt_omega_cache/nuscenes_front_4s_train_rich
+      val_feature_cache: data/vggt_omega_cache/nuscenes_front_4s_val_rich
+    navsim:
+      train_manifest: data/manifests/navsim_mini_train_4s.jsonl
+      val_manifest: data/manifests/navsim_mini_val_4s.jsonl
+      train_feature_cache: data/vggt_omega_cache/navsim_mini_front_4s_train_rich
+      val_feature_cache: data/vggt_omega_cache/navsim_mini_front_4s_val_rich
+
+navsim_export:
+  data_root: /inspire/hdd/global_public/public_datas/NAVSIM
+
+vision_backbone:
+  checkpoint_path: /inspire/hdd/project/spatiotemporal-intelligence-research/ky26298/Projects/pure_checkpoints/VGGT-Omega/vggt_omega_1b_512.pt
+
+train:
+  resume: never
+  initial_checkpoint: null
+  freeze_base: false
+

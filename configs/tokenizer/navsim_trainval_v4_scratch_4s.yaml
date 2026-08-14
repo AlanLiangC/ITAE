@@ -1,0 +1,40 @@
+_base_: nuscenes_navsim_v4_scratch_4s_cluster.yaml
+
+# Use this config with `--sources navsim`. Config inheritance intentionally keeps
+# the joint-training source schema compatible with existing V4 checkpoints.
+data:
+  num_workers: 16
+  # Full checksum validation is performed when cache generation/resume opens a
+  # completed cache. Avoid re-hashing hundreds of GB in every DataLoader worker.
+  verify_cache_checksums: false
+  sources:
+    navsim:
+      train_manifest: data/manifests/navsim_trainval_train_4s.jsonl
+      val_manifest: data/manifests/navsim_trainval_val_4s.jsonl
+      train_feature_cache: /inspire/qb-ilm2/project/spatiotemporal-intelligence-research/ky26298/itae_nvsim_cache/vggt_omega_cache/navsim_trainval_front_4s_train_rich
+      val_feature_cache: /inspire/qb-ilm2/project/spatiotemporal-intelligence-research/ky26298/itae_nvsim_cache/vggt_omega_cache/navsim_trainval_front_4s_val_rich
+      reference_point_offset_m: [0.0, 0.0]
+  sampling:
+    strategy: proportional
+    samples_per_epoch: null
+
+navsim_export:
+  split: trainval
+  split_unit: log
+  train_fraction: 0.9
+  split_seed: 42
+  # The official filter materializes candidates for every loaded log. Batching
+  # bounds peak RAM while the exporter streams completed windows to JSONL.
+  log_batch_size: 8
+
+train:
+  resume: auto
+  initial_checkpoint: null
+  freeze_base: false
+  epochs: 100
+  batch_size: 64
+  warmup_steps: 2000
+  early_stopping_patience: 20
+
+tensorboard:
+  evaluation_visualization_every_epochs: 1

@@ -55,6 +55,38 @@ def test_vggt_transform_matches_official_max_size(tmp_path: Path) -> None:
     assert torch.allclose(project, official)
 
 
+def test_action_window_image_lru_avoids_repeated_decode(tmp_path: Path) -> None:
+    image_path = tmp_path / "shared.png"
+    Image.new("RGB", (16, 16)).save(image_path)
+    transform_calls = []
+
+    def transform(_image: Image.Image) -> torch.Tensor:
+        transform_calls.append(1)
+        return torch.zeros(3, 16, 16)
+
+    records = [
+        WindowRecord(
+            sample_token=f"sample-{index}",
+            scene_token="scene",
+            anchor_timestamp_us=index,
+            image_paths=[str(image_path)],
+            image_timestamps_us=[index],
+            frame_times_s=[0.0],
+            trajectory=[[0.0, 0.0, 0.0]],
+            future_times_s=[0.1],
+            max_image_time_error_us=0,
+            max_trajectory_time_error_us=0,
+        )
+        for index in range(2)
+    ]
+    dataset = ActionWindowDataset(
+        records, transform=transform, image_cache_size=1
+    )
+    dataset[0]
+    dataset[1]
+    assert len(transform_calls) == 1
+
+
 def test_vggt_cache_rejects_incomplete_and_corrupt_shards(tmp_path: Path) -> None:
     record = WindowRecord(
         sample_token="sample",
@@ -146,6 +178,157 @@ def test_vggt_rich_register_cache_returns_all_tokens(tmp_path: Path) -> None:
     (tmp_path / "index.json").write_text(json.dumps(index), encoding="utf-8")
     sample = CachedVGGTOmegaFeatureDataset(base, tmp_path)[0]
     assert sample["register_hidden"].shape == (5, 16, 8)
+
+
+def test_vggt_cache_uses_binary_shard_lookup_and_sample_slices(tmp_path: Path) -> None:
+    records = [
+        WindowRecord(
+            sample_token=f"sample-{index}",
+            scene_token="scene",
+            anchor_timestamp_us=index,
+            image_paths=[],
+            image_timestamps_us=[],
+            frame_times_s=[0, 1, 2, 3, 4],
+            trajectory=[[0.0, 0.0, 0.0]] * 40,
+            future_times_s=[step / 10 for step in range(1, 41)],
+            max_image_time_error_us=0,
+            max_trajectory_time_error_us=0,
+        )
+        for index in range(2)
+    ]
+    base = ActionWindowDataset(records, load_images=False)
+    shards = []
+    for index in range(2):
+        path = tmp_path / f"features_{index:05d}.safetensors"
+        save_file(
+            {
+                "camera_hidden": torch.full((1, 5, 8), float(index)),
+                "register_hidden_mean": torch.zeros(1, 5, 8),
+                "pose_enc": torch.zeros(1, 5, 9),
+            },
+            path,
+        )
+        shards.append(
+            {
+                "file": path.name,
+                "start": index,
+                "end": index + 1,
+                "size_bytes": path.stat().st_size,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+        )
+    index = {
+        "cache_type": "vggt_omega_camera_head_hidden_v1",
+        "num_samples": 2,
+        "complete": True,
+        "camera_hidden_shape": [5, 8],
+        "register_hidden_mean_shape": [5, 8],
+        "pose_enc_shape": [5, 9],
+        "shards": shards,
+    }
+    (tmp_path / "index.json").write_text(json.dumps(index), encoding="utf-8")
+    dataset = CachedVGGTOmegaFeatureDataset(
+        base, tmp_path, verify_checksums=False
+    )
+    assert torch.all(dataset[0]["camera_hidden"] == 0)
+    assert torch.all(dataset[1]["camera_hidden"] == 1)
+
+
+def test_streaming_sample_token_hash_matches_stable_hash() -> None:
+    from tools.features.cache_vggt_omega_features import (
+        _partition_bounds,
+        _sample_token_order_sha256,
+    )
+    from vision_action_tokenizer.config import stable_hash
+
+    records = [
+        WindowRecord(
+            sample_token=token,
+            scene_token="scene",
+            anchor_timestamp_us=0,
+            image_paths=[],
+            image_timestamps_us=[],
+            frame_times_s=[],
+            trajectory=[],
+            future_times_s=[],
+            max_image_time_error_us=0,
+            max_trajectory_time_error_us=0,
+        )
+        for token in ("navsim:first", "navsim:测试")
+    ]
+    assert _sample_token_order_sha256(records, 2) == stable_hash(
+        [record.sample_token for record in records]
+    )
+    assert [_partition_bounds(10, 3, index) for index in range(3)] == [
+        (0, 3),
+        (3, 6),
+        (6, 10),
+    ]
+
+
+def test_merge_partitioned_vggt_caches(tmp_path: Path) -> None:
+    from tools.features.merge_vggt_omega_feature_caches import merge_feature_caches
+    from vision_action_tokenizer.models.vggt_omega import file_sha256
+
+    records = [
+        WindowRecord(
+            sample_token=f"sample-{index}",
+            scene_token="scene",
+            anchor_timestamp_us=index,
+            image_paths=[],
+            image_timestamps_us=[],
+            frame_times_s=[],
+            trajectory=[],
+            future_times_s=[],
+            max_image_time_error_us=0,
+            max_trajectory_time_error_us=0,
+        )
+        for index in range(4)
+    ]
+    manifest = tmp_path / "manifest.jsonl"
+    save_manifest(records, manifest)
+    part_directories = []
+    for part_index, range_start in enumerate((0, 2)):
+        directory = tmp_path / f"part-{part_index}"
+        directory.mkdir()
+        shard = directory / "features_00000.safetensors"
+        shard.write_bytes(f"part-{part_index}".encode())
+        index = {
+            "cache_type": "vggt_omega_camera_head_hidden_v1",
+            "manifest_sha256": file_sha256(manifest),
+            "manifest_num_samples": 4,
+            "num_partitions": 2,
+            "partition_index": part_index,
+            "range_start": range_start,
+            "range_end": range_start + 2,
+            "expected_num_samples": 2,
+            "num_samples": 2,
+            "complete": True,
+            "elapsed_seconds": 1.0,
+            "sample_token_order_sha256": "partition-only",
+            "shards": [
+                {
+                    "file": shard.name,
+                    "start": 0,
+                    "end": 2,
+                    "sha256": file_sha256(shard),
+                    "size_bytes": shard.stat().st_size,
+                }
+            ],
+        }
+        (directory / "index.json").write_text(json.dumps(index), encoding="utf-8")
+        part_directories.append(directory)
+
+    output = tmp_path / "merged"
+    merged = merge_feature_caches(part_directories, manifest, output)
+    assert merged["num_samples"] == 4
+    assert [(shard["start"], shard["end"]) for shard in merged["shards"]] == [
+        (0, 2),
+        (2, 4),
+    ]
+    assert (output / "features_00000.safetensors").stat().st_ino == (
+        part_directories[0] / "features_00000.safetensors"
+    ).stat().st_ino
 
 
 def test_multi_source_dataset_tags_source_and_sampler_is_deterministic() -> None:

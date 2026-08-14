@@ -14,7 +14,9 @@ encoder 的额外输入。
 
 当前推荐 tokenizer baseline 是 **V4 output-residual tokenizer**，使用 nuScenes 与 NAVSIM 联合
 训练。本 README 以在 Linux GPU 集群上复现该 tokenizer 为主；planner 实验见
-[Flow Planner 实验指南](docs/FLOW_PLANNER_EXPERIMENT_GUIDE.md)。
+[Flow Planner 实验指南](docs/FLOW_PLANNER_EXPERIMENT_GUIDE.md)。使用完整 NAVSIM trainval 扩大
+tokenizer 训练数据时，见
+[NAVSIM trainval Action Tokenizer 训练指南](docs/tokenizer/NAVSIM_TRAINVAL_ACTION_TOKENIZER_GUIDE.md)。
 
 ## 1. 任务定义
 

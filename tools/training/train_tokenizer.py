@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import math
 from collections import Counter
 from dataclasses import replace
@@ -35,6 +34,7 @@ from vision_action_tokenizer.data.trajectory import shift_se2_reference_point
 from vision_action_tokenizer.distributed import cleanup_distributed, initialize_distributed
 from vision_action_tokenizer.losses import LossConfig, TokenizerLoss
 from vision_action_tokenizer.models.factory import build_training_model
+from vision_action_tokenizer.models.vggt_omega import file_sha256
 from vision_action_tokenizer.trainer import (
     TokenizerTrainer,
     is_visual_residual_parameter,
@@ -147,6 +147,9 @@ def make_dataset(
             base,
             cache,
             manifest_path=manifest,
+            verify_checksums=bool(
+                config["data"].get("verify_cache_checksums", True)
+            ),
             expected_metadata={
                 "checkpoint_sha256": config["vision_backbone"].get(
                     "checkpoint_sha256"
@@ -157,15 +160,19 @@ def make_dataset(
             },
         )
     )
-    windows = [
-        replace(
-            window,
-            trajectory=shift_se2_reference_point(
-                window.trajectory, reference_point_offset_m
-            ).tolist(),
-        )
-        for window in base.windows
-    ]
+    if reference_point_offset_m == (0.0, 0.0):
+        # Avoid duplicating every trajectory in large trainval manifests.
+        windows = base.windows
+    else:
+        windows = [
+            replace(
+                window,
+                trajectory=shift_se2_reference_point(
+                    window.trajectory, reference_point_offset_m
+                ).tolist(),
+            )
+            for window in base.windows
+        ]
     if overfit_samples is not None:
         count = min(overfit_samples, len(dataset))
         dataset = Subset(dataset, range(count))
@@ -415,8 +422,8 @@ def main() -> None:
                 f"examples={sorted(overlap)[:5]}"
             )
         runtime_sources[source_name] = {
-            "train_manifest_sha256": hashlib.sha256(train_manifest.read_bytes()).hexdigest(),
-            "val_manifest_sha256": hashlib.sha256(val_manifest.read_bytes()).hexdigest(),
+            "train_manifest_sha256": file_sha256(train_manifest),
+            "val_manifest_sha256": file_sha256(val_manifest),
             "train_cache": str(spec["train_cache"]) if spec["train_cache"] else None,
             "val_cache": str(spec["val_cache"]) if spec["val_cache"] else None,
             "reference_point_offset_m": list(spec["reference_point_offset_m"]),

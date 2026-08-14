@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
 import time
+from itertools import islice
 from pathlib import Path
 
 import torch
@@ -17,6 +19,46 @@ from torch.utils.data import DataLoader, Subset
 from vision_action_tokenizer.config import load_config, stable_hash
 from vision_action_tokenizer.data.dataset import ActionWindowDataset, VGGTOmegaResize
 from vision_action_tokenizer.models.vggt_omega import OmegaCameraFeatureExtractor, file_sha256
+
+
+def _sample_token_order_sha256(windows, sample_count: int) -> str:
+    """Hash a JSON string list without materializing all trainval tokens."""
+    digest = hashlib.sha256()
+    digest.update(b"[")
+    for index, window in enumerate(windows):
+        if index >= sample_count:
+            break
+        if index:
+            digest.update(b", ")
+        digest.update(
+            json.dumps(
+                window.sample_token,
+                ensure_ascii=False,
+                default=str,
+            ).encode("utf-8")
+        )
+    digest.update(b"]")
+    return digest.hexdigest()
+
+
+def _partition_bounds(
+    sample_count: int,
+    num_partitions: int,
+    partition_index: int,
+    max_samples: int | None = None,
+) -> tuple[int, int]:
+    """Return one balanced, contiguous half-open manifest range."""
+    if sample_count <= 0:
+        raise ValueError("Cannot partition an empty manifest")
+    if num_partitions <= 0 or not 0 <= partition_index < num_partitions:
+        raise ValueError("Invalid cache partition selection")
+    start = sample_count * partition_index // num_partitions
+    end = sample_count * (partition_index + 1) // num_partitions
+    if max_samples is not None:
+        end = min(end, start + max_samples)
+    if end <= start:
+        raise ValueError("Selected cache partition is empty")
+    return start, end
 
 
 def _git_commit(repository: Path) -> str:
@@ -63,6 +105,10 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-samples", type=int)
     parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--prefetch-factor", type=int, default=2)
+    parser.add_argument("--image-cache-size", type=int, default=64)
+    parser.add_argument("--num-partitions", type=int, default=1)
+    parser.add_argument("--partition-index", type=int, default=0)
     args = parser.parse_args()
     if args.shard_size <= 0:
         raise ValueError("--shard-size must be positive")
@@ -70,6 +116,16 @@ def main() -> None:
         raise ValueError("--batch-size must be positive")
     if args.max_samples is not None and args.max_samples <= 0:
         raise ValueError("--max-samples must be positive")
+    if args.num_workers < 0:
+        raise ValueError("--num-workers must be non-negative")
+    if args.prefetch_factor <= 0:
+        raise ValueError("--prefetch-factor must be positive")
+    if args.image_cache_size < 0:
+        raise ValueError("--image-cache-size must be non-negative")
+    if args.num_partitions <= 0:
+        raise ValueError("--num-partitions must be positive")
+    if not 0 <= args.partition_index < args.num_partitions:
+        raise ValueError("--partition-index must be in [0, num-partitions)")
     if not torch.cuda.is_available():
         raise RuntimeError("VGGT-Omega feature extraction requires CUDA")
 
@@ -83,8 +139,20 @@ def main() -> None:
         mode=str(backbone["resize_mode"]),
         patch_size=int(backbone["patch_size"]),
     )
-    base = ActionWindowDataset(args.manifest, transform=transform, load_images=True)
-    sample_count = len(base) if args.max_samples is None else min(args.max_samples, len(base))
+    base = ActionWindowDataset(
+        args.manifest,
+        transform=transform,
+        load_images=True,
+        image_cache_size=args.image_cache_size,
+    )
+    manifest_sample_count = len(base)
+    range_start, range_end = _partition_bounds(
+        manifest_sample_count,
+        args.num_partitions,
+        args.partition_index,
+        args.max_samples,
+    )
+    sample_count = range_end - range_start
     checkpoint = Path(backbone["checkpoint_path"])
     checkpoint_sha = file_sha256(checkpoint)
     configured_sha = backbone.get("checkpoint_sha256")
@@ -95,8 +163,8 @@ def main() -> None:
         "cache_type": "vggt_omega_camera_head_hidden_v1",
         "dataset_names": sorted({window.dataset_name for window in base.windows}),
         "manifest_schema_versions": sorted({window.schema_version for window in base.windows}),
-        "sample_token_order_sha256": stable_hash(
-            [window.sample_token for window in base.windows[:sample_count]]
+        "sample_token_order_sha256": _sample_token_order_sha256(
+            islice(base.windows, range_start, range_end), sample_count
         ),
         "manifest_sha256": file_sha256(args.manifest),
         "checkpoint_path": str(checkpoint),
@@ -127,6 +195,16 @@ def main() -> None:
         ),
         "expected_num_samples": sample_count,
     }
+    if args.num_partitions > 1:
+        metadata.update(
+            {
+                "manifest_num_samples": manifest_sample_count,
+                "num_partitions": args.num_partitions,
+                "partition_index": args.partition_index,
+                "range_start": range_start,
+                "range_end": range_end,
+            }
+        )
     if token_mode == "camera_register_tokens":
         metadata["register_hidden_shape"] = [
             len(config["data"]["frame_offsets_s"]),
@@ -171,20 +249,26 @@ def main() -> None:
             return
         print(f"Resuming verified cache at sample {count}/{sample_count}", flush=True)
 
-    dataset = Subset(base, range(count, sample_count))
+    dataset = Subset(base, range(range_start + count, range_end))
+    loader_options: dict[str, object] = {
+        "batch_size": args.batch_size,
+        "shuffle": False,
+        "num_workers": args.num_workers,
+        "pin_memory": True,
+        "persistent_workers": args.num_workers > 0,
+    }
+    if args.num_workers > 0:
+        loader_options["prefetch_factor"] = args.prefetch_factor
     loader = DataLoader(
         dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        persistent_workers=args.num_workers > 0,
+        **loader_options,
     )
     extractor = OmegaCameraFeatureExtractor(
         checkpoint_path=checkpoint,
         expected_sha256=None,
         freeze=True,
     ).cuda().eval()
+    torch.cuda.reset_peak_memory_stats()
     pending: dict[str, list[torch.Tensor]] = {
         "camera_hidden": [],
         "register_hidden_mean": [],
@@ -231,6 +315,7 @@ def main() -> None:
                 "start": start,
                 "end": count,
                 "sha256": file_sha256(destination),
+                "size_bytes": destination.stat().st_size,
             }
         )
         shard_index += 1
@@ -271,12 +356,18 @@ def main() -> None:
                 elapsed = time.time() - started
                 rate = (count - resume_count) / max(elapsed, 1e-6)
                 print(
-                    f"cached={count}/{sample_count} rate={rate:.2f} windows/s",
+                    f"cached={count}/{sample_count} "
+                    f"global={range_start + count}/{manifest_sample_count} "
+                    f"rate={rate:.2f} windows/s",
                     flush=True,
                 )
         flush()
     write_progress(complete=True)
     index = json.loads(index_path.read_text(encoding="utf-8"))
+    print(
+        f"peak_cuda_memory_gib={torch.cuda.max_memory_allocated() / 2**30:.2f}",
+        flush=True,
+    )
     print(json.dumps(index, indent=2, ensure_ascii=False), flush=True)
 
 

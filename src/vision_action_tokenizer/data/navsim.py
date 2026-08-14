@@ -81,7 +81,7 @@ def split_navsim_logs(
     train_fraction: float = 0.8,
     seed: int = 42,
 ) -> tuple[list[str], list[str]]:
-    """Create a deterministic, log-disjoint mini train/validation split."""
+    """Create a deterministic, log-disjoint NAVSIM train/validation split."""
     if not 0.0 < train_fraction < 1.0:
         raise ValueError("train_fraction must be between zero and one")
     names = sorted(path.stem for path in Path(log_path).glob("*.pkl"))

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from bisect import bisect_right
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,14 @@ from torch.utils.data import Dataset
 
 from .manifest import WindowRecord, load_manifest
 from .trajectory import shift_se2_reference_point
+
+
+def _file_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 class VGGTOmegaResize:
@@ -118,10 +127,15 @@ class ActionWindowDataset(Dataset[Sample]):
         transform: Callable[[Image.Image], Tensor] | None = None,
         load_images: bool = True,
         reference_point_offset_m: tuple[float, float] = (0.0, 0.0),
+        image_cache_size: int = 0,
     ) -> None:
         self.windows = load_manifest(manifest) if isinstance(manifest, (str, Path)) else manifest
         self.transform = transform or VGGTOmegaResize(image_resolution=image_size)
         self.load_images = load_images
+        self.image_cache_size = int(image_cache_size)
+        if self.image_cache_size < 0:
+            raise ValueError("image_cache_size must be non-negative")
+        self._image_cache: OrderedDict[str, Tensor] = OrderedDict()
         self.reference_point_offset_m = tuple(map(float, reference_point_offset_m))
         if len(self.reference_point_offset_m) != 2:
             raise ValueError("reference_point_offset_m must contain [x, y]")
@@ -148,8 +162,15 @@ class ActionWindowDataset(Dataset[Sample]):
         if self.load_images:
             images = []
             for path in window.image_paths:
-                with Image.open(path) as image:
-                    images.append(self.transform(image))
+                cached = self._image_cache.pop(path, None)
+                if cached is None:
+                    with Image.open(path) as image:
+                        cached = self.transform(image)
+                if self.image_cache_size:
+                    self._image_cache[path] = cached
+                    if len(self._image_cache) > self.image_cache_size:
+                        self._image_cache.popitem(last=False)
+                images.append(cached)
             sample["images"] = torch.stack(images)
         return sample
 
@@ -213,9 +234,10 @@ class CachedVGGTOmegaFeatureDataset(Dataset[Sample]):
         cache_directory: str | Path,
         manifest_path: str | Path | None = None,
         expected_metadata: dict[str, object] | None = None,
+        verify_checksums: bool = True,
     ) -> None:
         try:
-            from safetensors.torch import load_file
+            from safetensors import safe_open
         except ImportError as error:
             raise ImportError("Install safetensors to use VGGT-Omega feature caches") from error
 
@@ -225,6 +247,9 @@ class CachedVGGTOmegaFeatureDataset(Dataset[Sample]):
             (self.cache_directory / "index.json").read_text(encoding="utf-8")
         )
         self.shards = self.index["shards"]
+        self._shard_ends = [int(shard["end"]) for shard in self.shards]
+        if self._shard_ends != sorted(self._shard_ends):
+            raise ValueError("VGGT-Omega cache shard ranges are not ordered")
         if self.index.get("cache_type") != "vggt_omega_camera_head_hidden_v1":
             raise ValueError("Not a supported VGGT-Omega CameraHead feature cache")
         if not self.index.get("complete", True):
@@ -239,7 +264,7 @@ class CachedVGGTOmegaFeatureDataset(Dataset[Sample]):
         elif token_mode != "camera_register_mean":
             raise ValueError(f"Unsupported VGGT-Omega cache token mode: {token_mode!r}")
         if manifest_path is not None:
-            digest = hashlib.sha256(Path(manifest_path).read_bytes()).hexdigest()
+            digest = _file_sha256(manifest_path)
             if self.index.get("manifest_sha256") != digest:
                 raise ValueError("VGGT-Omega cache was built from a different manifest")
         for key, expected in (expected_metadata or {}).items():
@@ -249,45 +274,46 @@ class CachedVGGTOmegaFeatureDataset(Dataset[Sample]):
                     f"VGGT-Omega cache metadata mismatch for {key}: "
                     f"{actual!r} != {expected!r}"
                 )
-        self._loaded_file: str | None = None
-        self._loaded_tensors: dict[str, Tensor] | None = None
+        self.verify_checksums = bool(verify_checksums)
         self._verified_files: set[str] = set()
-        self._load_file = load_file
+        self._safe_open = safe_open
 
     def __len__(self) -> int:
         return len(self.base)
 
     def __getitem__(self, index: int) -> dict[str, Tensor | str]:
         sample = self.base[index]
-        shard = next((item for item in self.shards if item["start"] <= index < item["end"]), None)
-        if shard is None:
+        shard_index = bisect_right(self._shard_ends, index)
+        if shard_index >= len(self.shards):
             raise IndexError(f"Sample {index} is missing from VGGT-Omega cache")
-        if self._loaded_file != shard["file"]:
-            shard_path = self.cache_directory / str(shard["file"])
-            if str(shard["file"]) not in self._verified_files:
-                actual_sha = hashlib.sha256(shard_path.read_bytes()).hexdigest()
+        shard = self.shards[shard_index]
+        if not int(shard["start"]) <= index < int(shard["end"]):
+            raise IndexError(f"Sample {index} is missing from VGGT-Omega cache")
+        shard_path = self.cache_directory / str(shard["file"])
+        if str(shard["file"]) not in self._verified_files:
+            expected_size = shard.get("size_bytes")
+            if expected_size is not None and shard_path.stat().st_size != int(expected_size):
+                raise ValueError(f"VGGT-Omega cache shard size mismatch: {shard_path}")
+            if self.verify_checksums:
+                actual_sha = _file_sha256(shard_path)
                 if actual_sha != shard.get("sha256"):
                     raise ValueError(
                         f"VGGT-Omega cache shard checksum mismatch: {shard_path}"
                     )
-                self._verified_files.add(str(shard["file"]))
-            self._loaded_tensors = self._load_file(
-                str(shard_path)
-            )
-            missing = set(self.tensor_keys) - set(self._loaded_tensors)
+            self._verified_files.add(str(shard["file"]))
+        offset = index - int(shard["start"])
+        with self._safe_open(str(shard_path), framework="pt", device="cpu") as tensors:
+            missing = set(self.tensor_keys) - set(tensors.keys())
             if missing:
                 raise ValueError(f"VGGT-Omega cache shard is missing tensors: {sorted(missing)}")
             for key in self.tensor_keys:
                 expected_shape = tuple(self.index[f"{key}_shape"])
-                actual_shape = tuple(self._loaded_tensors[key].shape[1:])
+                tensor_slice = tensors.get_slice(key)
+                actual_shape = tuple(tensor_slice.get_shape()[1:])
                 if actual_shape != expected_shape:
                     raise ValueError(
                         f"VGGT-Omega cache tensor shape mismatch for {key}: "
                         f"{actual_shape} != {expected_shape}"
                     )
-            self._loaded_file = shard["file"]
-        assert self._loaded_tensors is not None
-        offset = index - shard["start"]
-        for key in self.tensor_keys:
-            sample[key] = self._loaded_tensors[key][offset]
+                sample[key] = tensor_slice[offset]
         return sample

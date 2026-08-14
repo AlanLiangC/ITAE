@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from vision_action_tokenizer.data.manifest import WindowRecord
 from vision_action_tokenizer.data.navsim import split_navsim_logs
 from vision_action_tokenizer.data.trajectory import (
     dense_trajectory_to_native_rate,
@@ -97,6 +98,64 @@ def test_navsim_log_split_is_deterministic_and_disjoint(tmp_path: Path) -> None:
     assert first == second
     assert len(first[0]) == 7
     assert not set(first[0]) & set(first[1])
+
+
+def test_trainval_export_streams_batches_with_stable_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tools.data import build_navsim_manifest as exporter
+    from vision_action_tokenizer.data.navsim import NavsimExportConfig
+
+    def window(log_name: str) -> WindowRecord:
+        native = [[0.5 * step, 0.0, 0.0] for step in range(1, 9)]
+        dense = [[0.1 * step, 0.0, 0.0] for step in range(1, 41)]
+        return WindowRecord(
+            sample_token=f"navsim:{log_name}-sample",
+            scene_token=f"navsim:{log_name}-scene",
+            group_token=f"navsim:{log_name}",
+            anchor_timestamp_us=0,
+            image_paths=[],
+            image_timestamps_us=[0, 1, 2, 3, 4],
+            frame_times_s=[0, 1, 2, 3, 4],
+            trajectory=dense,
+            future_times_s=[step / 10 for step in range(1, 41)],
+            max_image_time_error_us=0,
+            max_trajectory_time_error_us=0,
+            dataset_name="navsim",
+            native_trajectory=native,
+        )
+
+    def fake_build(_config, *, log_names, max_scenes):
+        selected = list(reversed(log_names))
+        if max_scenes is not None:
+            selected = selected[:max_scenes]
+        windows = [window(name) for name in selected]
+        return windows, {
+            "num_candidates": len(windows),
+            "rejected": {"cross_scene": 0},
+            "max_image_time_error_us": 0,
+            "max_trajectory_time_error_us": 0,
+        }
+
+    monkeypatch.setattr(exporter, "build_navsim_windows", fake_build)
+    config = NavsimExportConfig(tmp_path, split="trainval")
+    logs = ["log-c", "log-a", "log-b"]
+    first_path = tmp_path / "first.jsonl"
+    second_path = tmp_path / "second.jsonl"
+    first_report, first_groups = exporter._export_split(
+        config, logs, first_path, log_batch_size=1, max_scenes=None
+    )
+    second_report, second_groups = exporter._export_split(
+        config, logs, second_path, log_batch_size=2, max_scenes=None
+    )
+    assert first_path.read_bytes() == second_path.read_bytes()
+    assert first_report["num_windows"] == 3
+    assert second_report["num_candidates"] == 3
+    assert first_groups == second_groups == {
+        "navsim:log-a",
+        "navsim:log-b",
+        "navsim:log-c",
+    }
 
 
 def test_se2_resampling_matches_nuplan_interpolated_trajectory() -> None:

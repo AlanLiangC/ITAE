@@ -1,0 +1,25 @@
+_base_: navsim_trainval_v4_scratch_4s.yaml
+
+data:
+  num_workers: 0
+  sources:
+    navsim:
+      train_manifest: data/manifests/navsim_trainval_smoke_train_4.jsonl
+      val_manifest: data/manifests/navsim_trainval_smoke_val_4.jsonl
+      train_feature_cache: data/vggt_omega_cache/navsim_trainval_smoke_train_4_rich
+      val_feature_cache: data/vggt_omega_cache/navsim_trainval_smoke_val_4_rich
+  sampling:
+    samples_per_epoch: 8
+
+train:
+  epochs: 2
+  batch_size: 4
+  warmup_steps: 0
+  log_every: 1
+  early_stopping_patience: 0
+
+tensorboard:
+  evaluation_visualization_items: 4
+  evaluation_visualization_items_per_source: 4
+  evaluation_visualization_every_epochs: 1
+  evaluation_visualization_distinct_scenes: false
