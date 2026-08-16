@@ -6,4 +6,4 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
   --config configs/tokenizer/navsim_trainval_v4_scratch_4s.yaml \
   --sources navsim \
   --output output/navsim_trainval_v4_scratch_4gpu \
-  --no-resume
+  --resume output/navsim_trainval_v4_scratch_4gpu/last.pt

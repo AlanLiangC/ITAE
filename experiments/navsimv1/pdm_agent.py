@@ -228,7 +228,12 @@ class SUVNavsimV1Agent(AbstractAgent):
         return "suv_navsimv1_agent"
 
     def get_sensor_config(self):
-        return SensorConfig.build_front_only_sensors(include=True)
+        # NAVSIM v1.1 has no ``build_front_only_sensors`` convenience helper.
+        # Start from its stable no-sensor API and enable only the single front
+        # camera used by the published SUV evaluation protocol.
+        sensor_config = SensorConfig.build_no_sensors()
+        sensor_config.cam_f0 = True
+        return sensor_config
 
     def initialize(self) -> None:
         if self.model is not None:

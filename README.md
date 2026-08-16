@@ -17,6 +17,8 @@ encoder 的额外输入。
 [Flow Planner 实验指南](docs/FLOW_PLANNER_EXPERIMENT_GUIDE.md)。使用完整 NAVSIM trainval 扩大
 tokenizer 训练数据时，见
 [NAVSIM trainval Action Tokenizer 训练指南](docs/tokenizer/NAVSIM_TRAINVAL_ACTION_TOKENIZER_GUIDE.md)。
+复现 SUV 在 NAVSIM v1 上的官方 PDMS 时，见
+[SUV NAVSIM v1 测评指南](docs/suv/NAVSIM_V1_EVALUATION_GUIDE.md)。
 
 ## 1. 任务定义
 

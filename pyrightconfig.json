@@ -1,3 +1,4 @@
 {
-    "exclude": ["data"]
+    "exclude": ["data", "output"],
+    "typeCheckingMode": "off"
 }
