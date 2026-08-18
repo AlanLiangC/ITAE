@@ -10,6 +10,7 @@ from pathlib import Path
 import torch
 from safetensors.torch import save_file
 from torch.utils.data import DataLoader, Subset
+from tqdm.auto import tqdm
 
 from vision_action_tokenizer.config import load_config, stable_hash
 from vision_action_tokenizer.data.dataset import (
@@ -97,7 +98,12 @@ def main() -> None:
     fde_sum = 0.0
     sample_count = 0
     with torch.inference_mode():
-        for batch in loader:
+        for batch in tqdm(
+            loader,
+            desc="Caching ITAE action targets",
+            unit="batch",
+            dynamic_ncols=True,
+        ):
             future = batch["future_times"].to(device).float()
             output = tokenizer(
                 batch["camera_hidden"].to(device).float(),

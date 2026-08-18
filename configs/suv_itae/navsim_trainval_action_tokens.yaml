@@ -1,0 +1,72 @@
+seed: 42
+
+paths:
+  base_checkpoint: /inspire/hdd/project/spatiotemporal-intelligence-research/ky26298/Projects/pure_checkpoints/SUV_ckpt/suv_navsim.pt
+  model_config: experiments/suv_itae/config/model/suv_itae_navsim.yaml
+  tokenizer_config: output/navsim_trainval_v4_scratch_4gpu/resolved_config.json
+  tokenizer_checkpoint: output/navsim_trainval_v4_scratch_4gpu/best.pt
+  train_manifest: data/manifests/navsim_trainval_train_4s.jsonl
+  val_manifest: data/manifests/navsim_trainval_val_4s.jsonl
+  train_action_targets: output/suv_itae/action_targets/train.safetensors
+  val_action_targets: output/suv_itae/action_targets/validation.safetensors
+  text_cache: output/suv/navsim_v1/text_embeddings
+  output: output/suv_itae/navsim_trainval
+
+data:
+  image_size: [384, 640]
+  crop_top_bottom: 28
+  num_workers: 8
+
+flow:
+  shift: 5.0
+  num_timesteps: 1000
+
+train:
+  precision: bf16
+  # Profiled on 2x RTX 4090 48GB: per-GPU 32 reaches 96.5% of the batch-64
+  # throughput while peaking at 25.32 GiB allocated / 26.62 GiB reserved.
+  batch_size: 32
+  gradient_accumulation_steps: 1
+  # Linear scaling from the original effective batch 16 to global batch 64.
+  learning_rate: 4.0e-5
+  betas: [0.9, 0.95]
+  weight_decay: 0.01
+  # 7,500 * 64 ~= the original 30,000 * 16 sample budget (about one epoch).
+  max_steps: 7500
+  warmup_steps: 250
+  min_lr_ratio: 0.1
+  grad_clip_norm: 1.0
+  normalizer_epsilon: 1.0e-4
+  # null trains all 30 action blocks. Set 8 for a lower-memory/communication ablation.
+  last_n_blocks: null
+  log_every_steps: 10
+  eval_every_steps: 250
+  save_every_steps: 250
+
+validation:
+  max_batches: 8
+
+tensorboard:
+  enabled: true
+  # Relative paths are resolved below paths.output.
+  log_dir: tensorboard
+  flush_secs: 30
+  qualitative:
+    enabled: true
+    # Training validation runs every 250 steps; render at the same cadence.
+    every_steps: 250
+    # Fixed turn / straight / dynamic clips are selected once per run.
+    num_clips: 3
+    clip_frames: 16
+    # NAVSIM anchors are 2 Hz; a larger gap starts a new contiguous run.
+    max_gap_s: 0.65
+    inference_steps: 10
+    # Each clip frame is an independent prediction; batching only improves GPU use.
+    inference_batch_size: 8
+    seed: 2026
+    fps: 2
+    # [height, width], kept compact because TensorBoard stores videos as GIFs.
+    frame_size: [432, 768]
+    save_mp4: true
+    navsim_data_root: /inspire/hdd/global_public/public_datas/NAVSIM
+    navsim_split: trainval

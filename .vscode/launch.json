@@ -412,6 +412,39 @@
             }
         },
         {
+            "name": "SUV-ITAE: Debug train smoke (1 GPU)",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/inspire/qb-ilm2/project/spatiotemporal-intelligence-research/ky26298/conda_envs/suv-navsim1/bin/python",
+            "module": "tools.suv_itae.train",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "subProcess": true,
+            "args": [
+                "--config", "${workspaceFolder}/configs/suv_itae/navsim_trainval_action_tokens.yaml",
+                "--output", "${workspaceFolder}/output/suv_itae/debug_train",
+                "--overfit-samples", "4",
+                "--max-steps", "1",
+                "--batch-size", "1",
+                "--gradient-accumulation-steps", "1",
+                "--max-validation-batches", "1",
+                "--last-n-blocks", "1",
+                "--num-workers", "0",
+                "--no-resume"
+            ],
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0",
+                "CKPT_LOCAL_DIR": "/inspire/hdd/project/spatiotemporal-intelligence-research/ky26298/Projects/pure_checkpoints/SUV_ckpt",
+                "DIFFSYNTH_SKIP_DOWNLOAD": "true",
+                "HF_HUB_OFFLINE": "1",
+                "TRANSFORMERS_OFFLINE": "1",
+                "PYTHONUNBUFFERED": "1",
+                "PYTHONPATH": "${workspaceFolder}/third_party/SUV/src:${workspaceFolder}/src:${workspaceFolder}",
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+            }
+        },
+        {
             "name": "Python Debugger: Current File (py312torch210cu126)",
             "type": "debugpy",
             "request": "launch",

@@ -105,8 +105,7 @@ conda run -n suv-navsim1 \
   --run-root "${SMOKE_ROOT}" --gpus 0 --max-scenes 1 --batch-size 1
 
 # 3) 加载 SUV 权重并完成一次官方 PDM scoring
-conda run -n suv-navsim1 \
-  python -m tools.suv.evaluate_navsim_v1 evaluate \
+bash scripts/suv/evaluate_navsim_v1.sh \
   --run-root "${SMOKE_ROOT}" --gpus 0 --max-scenes 1
 
 # 4) 检查结果文件和汇总器
@@ -157,9 +156,15 @@ conda run -n suv-navsim1 \
 ### 5.3 双卡 PDM scoring
 
 ```bash
-conda run -n suv-navsim1 \
-  python -m tools.suv.evaluate_navsim_v1 evaluate \
-  --gpus 0,1
+bash scripts/suv/evaluate_navsim_v1.sh --gpus 0,1
+```
+
+该脚本等价于给 `conda run` 添加 `--no-capture-output`，因此模型加载日志和每张 GPU 的
+`scene/s`、完成数量、成功/失败数量以及 ETA 会实时刷新。若直接使用 Python 入口，也必须写成：
+
+```bash
+conda run --no-capture-output -n suv-navsim1 \
+  python -u -m tools.suv.evaluate_navsim_v1 evaluate --gpus 0,1
 ```
 
 这里使用的是项目根目录的

@@ -307,6 +307,8 @@ def precompute_text(args: argparse.Namespace, paths: RuntimePaths) -> None:
         str(args.batch_size),
         "--overwrite",
         str(args.overwrite).lower(),
+        "--prompt-mode",
+        str(args.prompt_mode),
     ]
     if args.max_scenes is not None:
         command.extend(["--max-tokens", str(args.max_scenes)])
@@ -319,6 +321,38 @@ def evaluate(args: argparse.Namespace, paths: RuntimePaths) -> None:
         raise RuntimeError(f"Text embedding cache is missing or empty: {paths.text_cache}")
     gpu_ids = _gpu_ids(args.gpus)
     paths.output_dir.mkdir(parents=True, exist_ok=True)
+    is_itae = args.itae_adapter is not None
+    itae_adapter = None
+    tokenizer_config = None
+    tokenizer_checkpoint = None
+    if is_itae:
+        itae_adapter = _absolute(args.itae_adapter)
+        tokenizer_config = _absolute(
+            args.action_tokenizer_config
+            or REPOSITORY_ROOT
+            / "output/navsim_trainval_v4_scratch_4gpu/resolved_config.json"
+        )
+        tokenizer_checkpoint = _absolute(
+            args.action_tokenizer_checkpoint
+            or REPOSITORY_ROOT / "output/navsim_trainval_v4_scratch_4gpu/best.pt"
+        )
+        missing = [
+            str(path)
+            for path in (itae_adapter, tokenizer_config, tokenizer_checkpoint)
+            if not path.is_file()
+        ]
+        if missing:
+            raise FileNotFoundError(f"SUV-ITAE evaluation inputs are missing: {missing}")
+    agent_target = (
+        "experiments.suv_itae.navsimv1_agent.SUVITAENavsimV1Agent"
+        if is_itae
+        else "experiments.navsimv1.pdm_agent.SUVNavsimV1Agent"
+    )
+    model_config = (
+        REPOSITORY_ROOT / "experiments/suv_itae/config/model/suv_itae_navsim.yaml"
+        if is_itae
+        else REPOSITORY_ROOT / "experiments/navsimv1/config/model/suv_navsim.yaml"
+    )
     overrides = [
         "train_test_split=navtest",
         "train_test_split.scene_filter.num_history_frames=4",
@@ -331,15 +365,30 @@ def evaluate(args: argparse.Namespace, paths: RuntimePaths) -> None:
         "worker=single_machine_thread_pool",
         "worker.max_workers=1",
         "worker.use_process_pool=false",
-        "agent._target_=experiments.navsimv1.pdm_agent.SUVNavsimV1Agent",
+        f"agent._target_={agent_target}",
         f"++agent.checkpoint_path={paths.checkpoint_root / 'suv_navsim.pt'}",
-        "++agent.model_config_path="
-        f"{REPOSITORY_ROOT / 'experiments/navsimv1/config/model/suv_navsim.yaml'}",
+        f"++agent.model_config_path={model_config}",
         f"++agent.text_embedding_cache_dir={paths.text_cache}",
-        "++agent.visual_conditioning=history_4",
-        "++agent.slot_inference=true",
         f"++agent.num_inference_steps={args.inference_steps}",
     ]
+    if is_itae:
+        assert itae_adapter is not None
+        assert tokenizer_config is not None
+        assert tokenizer_checkpoint is not None
+        overrides.extend(
+            [
+                f"++agent.adapter_checkpoint_path={itae_adapter}",
+                f"++agent.action_tokenizer_config_path={tokenizer_config}",
+                f"++agent.action_tokenizer_checkpoint_path={tokenizer_checkpoint}",
+            ]
+        )
+    else:
+        overrides.extend(
+            [
+                "++agent.visual_conditioning=history_4",
+                "++agent.slot_inference=true",
+            ]
+        )
     if args.max_scenes is not None:
         overrides.append(f"train_test_split.scene_filter.max_scenes={args.max_scenes}")
     command = [
@@ -487,12 +536,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     text.add_argument("--batch-size", type=int, default=16)
     text.add_argument("--max-scenes", type=int)
     text.add_argument("--overwrite", action="store_true")
+    text.add_argument("--prompt-mode", choices=["static", "dynamic"], default="dynamic")
     text.add_argument("--dry-run", action="store_true")
 
     evaluation = subparsers.add_parser("evaluate", parents=[common])
     evaluation.add_argument("--gpus", default=os.environ.get("CUDA_VISIBLE_DEVICES", "0"))
     evaluation.add_argument("--inference-steps", type=int, default=10)
     evaluation.add_argument("--max-scenes", type=int)
+    evaluation.add_argument("--itae-adapter", type=Path)
+    evaluation.add_argument("--action-tokenizer-config", type=Path)
+    evaluation.add_argument("--action-tokenizer-checkpoint", type=Path)
     evaluation.add_argument("--dry-run", action="store_true")
 
     summary = subparsers.add_parser("summarize", parents=[common])

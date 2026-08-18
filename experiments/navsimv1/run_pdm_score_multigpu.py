@@ -20,16 +20,15 @@ import pandas as pd
 import torch.nn as nn
 from hydra import compose, initialize_config_dir
 from hydra.utils import instantiate
-from omegaconf import DictConfig
-
 from navsim.agents.abstract_agent import AbstractAgent
-from navsim.common.dataloader import MetricCacheLoader, SceneFilter, SceneLoader
 from navsim.common.dataclasses import SensorConfig
+from navsim.common.dataloader import MetricCacheLoader, SceneFilter, SceneLoader
 from navsim.evaluate.pdm_score import pdm_score
 from navsim.planning.metric_caching.metric_cache import MetricCache
 from navsim.planning.simulation.planner.pdm_planner.scoring.pdm_scorer import PDMScorer
 from navsim.planning.simulation.planner.pdm_planner.simulation.pdm_simulator import PDMSimulator
-
+from omegaconf import DictConfig
+from tqdm.auto import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -172,7 +171,19 @@ def _evaluate_tokens(cfg: DictConfig, tokens: list[str], rank: int) -> pd.DataFr
         return pd.DataFrame(columns=["token", "valid"])
 
     start_time = time.time()
-    for idx, token in enumerate(tokens_to_evaluate):
+    progress = tqdm(
+        tokens_to_evaluate,
+        desc=f"GPU rank {rank}",
+        unit="scene",
+        position=rank,
+        leave=True,
+        dynamic_ncols=True,
+        mininterval=1.0,
+        disable=not sys.stderr.isatty(),
+    )
+    num_valid = 0
+    num_failed = 0
+    for idx, token in enumerate(progress):
         score_row: dict[str, Any] = {"token": token, "valid": True}
         try:
             metric_cache_path = metric_cache_loader.metric_cache_paths[token]
@@ -200,7 +211,9 @@ def _evaluate_tokens(cfg: DictConfig, tokens: list[str], rank: int) -> pd.DataFr
                 score_row["average_displacement_error_m"] = np.nan
                 score_row["final_displacement_error_m"] = np.nan
                 score_row["trajectory_error_num_steps"] = np.nan
-                logger.warning("[rank=%d] Trajectory error metrics failed for token %s", rank, token)
+                logger.warning(
+                    "[rank=%d] Trajectory error metrics failed for token %s", rank, token
+                )
                 traceback.print_exc()
 
             visualize_hook = getattr(agent, "maybe_visualize_pdm_score_sample", None)
@@ -272,6 +285,11 @@ def _evaluate_tokens(cfg: DictConfig, tokens: list[str], rank: int) -> pd.DataFr
             score_row["valid"] = False
 
         results.append(score_row)
+        if score_row["valid"]:
+            num_valid += 1
+        else:
+            num_failed += 1
+        progress.set_postfix(valid=num_valid, failed=num_failed, refresh=False)
         if (idx + 1) % 50 == 0 or idx == len(tokens_to_evaluate) - 1:
             elapsed = time.time() - start_time
             speed = (idx + 1) / max(elapsed, 1e-6)
@@ -336,7 +354,11 @@ def _run_parent(args: argparse.Namespace) -> None:
     token_file = output_dir / "_tokens.txt"
     token_file.write_text("\n".join(tokens) + "\n")
 
-    logger.info("Starting NAVSIM v1 multi-GPU PDM eval: world_size=%d tokens=%d", world_size, len(tokens))
+    logger.info(
+        "Starting NAVSIM v1 multi-GPU PDM eval: world_size=%d tokens=%d",
+        world_size,
+        len(tokens),
+    )
     processes: list[tuple[int, subprocess.Popen[str]]] = []
     for rank, device in enumerate(devices):
         cmd = [
@@ -394,7 +416,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--world-size", type=int, default=1)
     parser.add_argument("--token-file", type=str, default="")
     parser.add_argument("--output-dir", type=str, required=True)
-    parser.add_argument("--cuda-visible-devices", type=str, default=os.environ.get("CUDA_VISIBLE_DEVICES", "0"))
+    parser.add_argument(
+        "--cuda-visible-devices",
+        type=str,
+        default=os.environ.get("CUDA_VISIBLE_DEVICES", "0"),
+    )
     parser.add_argument("--num-gpus", type=int, default=0)
     parser.add_argument("--overrides", nargs="*", default=[])
     return parser.parse_args()

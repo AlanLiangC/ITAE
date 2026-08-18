@@ -34,12 +34,15 @@ conda run -n "${TARGET_ENV}" python -m pip install \
   --no-build-isolation --no-deps -e "${NAVSIM_V1_ROOT}"
 conda run -n "${TARGET_ENV}" python -m pip install \
   --no-build-isolation --no-deps -e "${REPO_ROOT}/third_party/SUV"
+conda run -n "${TARGET_ENV}" python -m pip install \
+  --no-build-isolation --no-deps -e "${REPO_ROOT}"
 conda run -n "${TARGET_ENV}" python -m pip install -i "${PYPI_INDEX_URL}" \
   control==0.9.1 \
   einops==0.8.1 \
   huggingface-hub==0.29.2 \
   hydra-core==1.3.2 \
   modelscope==1.34.0 \
+  moviepy==1.0.3 \
   omegaconf==2.3.0 \
   opencv-python-headless==4.9.0.80 \
   pandas==2.2.3 \
@@ -53,6 +56,7 @@ conda run -n "${TARGET_ENV}" python -m pip install -i "${PYPI_INDEX_URL}" \
   safetensors==0.5.3 \
   scikit-learn==1.4.2 \
   setuptools==80.9.0 \
+  tensorboard==2.21.0 \
   tqdm==4.66.5 \
   transformers==4.49.0 \
   ujson

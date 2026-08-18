@@ -10,8 +10,9 @@ import os
 import re
 import sys
 import uuid
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from tqdm import tqdm
 
@@ -139,7 +140,9 @@ def _build_prompt_from_agent_input(
     from experiments.navsimv1.data.prompts import build_navsim_prompts, stagea_prompt_overrides
 
     ego_status = NavsimV1FeatureBuilder._ego_status_tensor(agent_input)
-    prompt_prefix, future_instruction, quality_instruction = stagea_prompt_overrides(stagea_modality)
+    prompt_prefix, future_instruction, quality_instruction = stagea_prompt_overrides(
+        stagea_modality
+    )
     history_seconds = (
         float(ego_status.shape[0]) / float(args.fps)
         if args.prompt_history_seconds is None
@@ -160,6 +163,14 @@ def _build_prompt_from_agent_input(
 
 
 def _collect_unique_prompts(args: argparse.Namespace) -> tuple[list[str], dict[str, int]]:
+    if str(args.prompt_mode).strip().lower() == "static":
+        from experiments.navsimv1.data.prompts import stagea_prompt_overrides
+
+        prompts = [
+            stagea_prompt_overrides(modality)[0]
+            for modality in SLOT_JOINT_MODALITIES
+        ]
+        return prompts, {"tokens": 0, "unique_prompts": len(prompts)}
     scene_loader = _build_scene_loader(args)
     tokens = _tokens_for_split(scene_loader)
     if args.max_tokens is not None:
@@ -190,8 +201,14 @@ def _cache_path(cache_dir: Path, prompt: str, context_len: int, enc_id: str) -> 
     return cache_dir / f"{hashed}.t5_len{context_len}.{enc_id}.pt"
 
 
-def _print_prompt_cache_stats(prompts: list[str], cache_dir: Path, context_len: int, enc_id: str) -> tuple[int, int]:
-    existing = sum(1 for prompt in prompts if _cache_path(cache_dir, prompt, context_len, enc_id).exists())
+def _print_prompt_cache_stats(
+    prompts: list[str], cache_dir: Path, context_len: int, enc_id: str
+) -> tuple[int, int]:
+    existing = sum(
+        1
+        for prompt in prompts
+        if _cache_path(cache_dir, prompt, context_len, enc_id).exists()
+    )
     missing = len(prompts) - existing
     print(f"text embedding cache: {cache_dir}")
     print(f"unique prompts:       {len(prompts)}")
@@ -200,9 +217,15 @@ def _print_prompt_cache_stats(prompts: list[str], cache_dir: Path, context_len: 
     return existing, missing
 
 
-def _encode_missing_prompts(prompts: list[str], args: argparse.Namespace, *, rank: int, world_size: int, local_rank: int) -> None:
+def _encode_missing_prompts(
+    prompts: list[str],
+    args: argparse.Namespace,
+    *,
+    rank: int,
+    world_size: int,
+    local_rank: int,
+) -> None:
     import torch
-
     from suv.models.wan22.helpers.loader import _load_registered_model, _resolve_configs
     from suv.models.wan22.wan_video_text_encoder import HuggingfaceTokenizer
 
@@ -269,7 +292,10 @@ def _encode_missing_prompts(prompts: list[str], args: argparse.Namespace, *, ran
                 context = text_encoder(ids, mask)
                 for idx, prompt in enumerate(batch_prompts):
                     payload = {
-                        "context": context[idx].detach().to(device="cpu", dtype=torch.bfloat16).contiguous(),
+                        "context": context[idx]
+                        .detach()
+                        .to(device="cpu", dtype=torch.bfloat16)
+                        .contiguous(),
                         "mask": mask[idx].detach().to(device="cpu", dtype=torch.bool).contiguous(),
                     }
                     _atomic_torch_save(payload, _cache_path(cache_dir, prompt, context_len, enc_id))
@@ -301,9 +327,22 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--overwrite", type=_str_to_bool, default=False)
     parser.add_argument("--redirect-common-files", type=_str_to_bool, default=False)
-    parser.add_argument("--dry-run", action="store_true", help="Only collect prompts and report missing caches.")
-    parser.add_argument("--validate-only", action="store_true", help="Exit non-zero if any prompt cache is missing.")
-    parser.add_argument("--max-tokens", type=int, default=None, help="Debug helper to scan only the first N tokens.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Only collect prompts and report missing caches.",
+    )
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="Exit non-zero if any prompt cache is missing.",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help="Debug helper to scan only the first N tokens.",
+    )
     return parser.parse_args(list(argv))
 
 
