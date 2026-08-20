@@ -169,6 +169,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument(
+        "--recover-checkpoint-only",
+        action="store_true",
+        help="Repair/finalize the selected resume checkpoint and exit before training",
+    )
     parser.add_argument("--max-steps", type=int)
     parser.add_argument("--overfit-samples", type=int)
     parser.add_argument("--num-workers", type=int)
@@ -297,6 +302,29 @@ def flow_loss(
         "sigma": float(sigma.float().mean()),
         "prediction_rms": float(prediction.float().square().mean().sqrt().detach()),
     }
+
+
+def atomic_torch_save(payload: dict[str, Any], destination: Path) -> None:
+    """Write a checkpoint beside its destination, then atomically replace it."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.tmp")
+    try:
+        torch.save(payload, temporary)
+        os.replace(temporary, destination)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def load_checkpoint(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    if path.stat().st_size == 0:
+        raise EOFError(f"Checkpoint is empty: {path}")
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f"Checkpoint payload is not a dictionary: {path}")
+    return checkpoint
 
 
 def select_qualitative_clips(
@@ -643,33 +671,119 @@ def main() -> None:
         global_step = 0
         epoch = 0
         best_val = float("inf")
+        adapter_only_resume = False
         resume = args.resume
-        if resume is None and not args.no_resume and (output / "last.pt").is_file():
+        checkpoint: dict[str, Any] | None = None
+        automatic_resume = resume is None and not args.no_resume
+        if automatic_resume and (output / "last.pt").is_file():
             resume = output / "last.pt"
+            try:
+                checkpoint = load_checkpoint(resume)
+            except Exception as error:
+                fallback = output / "best.pt"
+                if not fallback.is_file() or fallback.stat().st_size == 0:
+                    raise RuntimeError(
+                        f"Automatic resume checkpoint is corrupt and no usable best.pt "
+                        f"exists: {resume}"
+                    ) from error
+                if rank == 0:
+                    print(
+                        f"WARNING: cannot load {resume}: {error}. "
+                        f"Falling back to adapter-only checkpoint {fallback}; "
+                        "AdamW moments will be reinitialized.",
+                        flush=True,
+                    )
+                resume = fallback
+                checkpoint = load_checkpoint(resume)
         if resume is not None:
-            checkpoint = torch.load(resume, map_location="cpu", weights_only=False)
+            if checkpoint is None:
+                checkpoint = load_checkpoint(resume)
             if checkpoint.get("format") != ADAPTER_FORMAT:
                 raise ValueError(f"Not a SUV-ITAE adapter: {resume}")
             model.action_expert.load_state_dict(checkpoint["action_expert"], strict=True)
             normalizer.load_state_dict(checkpoint["normalizer"], strict=True)
-            optimizer.load_state_dict(checkpoint["optimizer"])
-            scheduler.load_state_dict(checkpoint["scheduler"])
             global_step = int(checkpoint["global_step"])
             epoch = int(checkpoint.get("epoch", 0))
             best_val = float(checkpoint.get("best_val_loss", best_val))
+            has_optimizer = "optimizer" in checkpoint
+            has_scheduler = "scheduler" in checkpoint
+            if has_optimizer != has_scheduler:
+                raise ValueError(
+                    f"Checkpoint contains only one of optimizer/scheduler: {resume}"
+                )
+            if has_optimizer:
+                optimizer.load_state_dict(checkpoint["optimizer"])
+                scheduler.load_state_dict(checkpoint["scheduler"])
+                if optimizer.state:
+                    resume_description = "full training state"
+                else:
+                    resume_description = "scheduler state with fresh AdamW moments"
+            else:
+                adapter_only_resume = True
+                factor = float(lr_lambda(global_step))
+                restored_lrs = []
+                for group, base_lr in zip(
+                    optimizer.param_groups, scheduler.base_lrs, strict=True
+                ):
+                    learning_rate = float(base_lr) * factor
+                    group["lr"] = learning_rate
+                    restored_lrs.append(learning_rate)
+                scheduler.last_epoch = global_step
+                scheduler._step_count = global_step + 1  # noqa: SLF001
+                scheduler._last_lr = restored_lrs  # noqa: SLF001
+                resume_description = "adapter weights with fresh AdamW state"
             if rank == 0:
-                print(f"Resumed {resume} at step {global_step}", flush=True)
+                print(
+                    f"Resumed {resume} at step {global_step} "
+                    f"({resume_description})",
+                    flush=True,
+                )
+                previous_config = checkpoint.get("config", {})
+                previous_runtime = previous_config.get("runtime", {})
+                previous_train = previous_config.get("train", {})
+                previous_world = int(previous_runtime.get("world_size", world))
+                previous_per_gpu = int(
+                    previous_runtime.get(
+                        "per_gpu_batch_size",
+                        previous_train.get("batch_size", batch_size),
+                    )
+                )
+                previous_global_batch = previous_world * previous_per_gpu
+                current_global_batch = world * batch_size
+                if previous_global_batch != current_global_batch:
+                    suggested = (
+                        previous_global_batch // world
+                        if previous_global_batch % world == 0
+                        else None
+                    )
+                    suggestion = (
+                        f" Use --batch-size {suggested} to preserve it."
+                        if suggested is not None
+                        else " Adjust batch size/accumulation and learning rate explicitly."
+                    )
+                    print(
+                        f"WARNING: global micro-batch changes from "
+                        f"{previous_global_batch} to {current_global_batch}."
+                        + suggestion,
+                        flush=True,
+                    )
+            del checkpoint
 
         resolved = {
             **config,
             "runtime": {
                 "world_size": world,
+                "per_gpu_batch_size": batch_size,
+                "global_micro_batch_size": batch_size * world,
                 "train_samples": len(train_dataset),
                 "validation_samples": len(val_dataset),
                 "trainable_parameters": sum(p.numel() for p in parameters),
                 "text_context": str(context_path),
                 "action_shape": list(ACTION_SHAPE),
                 "last_n_blocks": last_n_blocks,
+                "resume_checkpoint": str(resume) if resume is not None else None,
+                "adapter_only_resume": adapter_only_resume,
+                "optimizer_state_entries_at_resume": len(optimizer.state),
                 "qualitative_clips": [
                     {
                         "label": clip["label"],
@@ -706,6 +820,28 @@ def main() -> None:
             if include_optimizer:
                 value.update(optimizer=optimizer.state_dict(), scheduler=scheduler.state_dict())
             return value
+
+        if adapter_only_resume:
+            if rank == 0:
+                atomic_torch_save(adapter_payload(True), output / "last.pt")
+                print(
+                    f"Recovered a valid atomic last.pt at step {global_step}; "
+                    "optimizer state starts fresh.",
+                    flush=True,
+                )
+            if world > 1:
+                dist.barrier()
+        if args.recover_checkpoint_only:
+            if not adapter_only_resume and rank == 0:
+                atomic_torch_save(adapter_payload(True), output / "last.pt")
+            if world > 1:
+                dist.barrier()
+            if rank == 0:
+                print(
+                    f"Checkpoint recovery complete at step {global_step}; exiting as requested.",
+                    flush=True,
+                )
+            return
 
         accumulation = int(
             args.gradient_accumulation_steps
@@ -1221,7 +1357,9 @@ def main() -> None:
                             writer.add_scalar("validation/flow_loss", value, global_step)
                         if value < best_val:
                             best_val = value
-                            torch.save(adapter_payload(False), output / "best.pt")
+                            atomic_torch_save(
+                                adapter_payload(False), output / "best.pt"
+                            )
                         if bool(qualitative_cfg.get("enabled", True)) and (
                             global_step % qualitative_every == 0
                         ):
@@ -1229,7 +1367,7 @@ def main() -> None:
                 if rank == 0 and (
                     global_step % save_every == 0 or global_step == max_steps
                 ):
-                    torch.save(adapter_payload(True), output / "last.pt")
+                    atomic_torch_save(adapter_payload(True), output / "last.pt")
                 if world > 1 and (
                     global_step % eval_every == 0
                     or global_step % save_every == 0

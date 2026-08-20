@@ -142,9 +142,22 @@ GPUS=0,1 bash scripts/suv_itae/train.sh
 GPUS=0,1,2,3 bash scripts/suv_itae/train.sh
 ```
 
-脚本按 `GPUS` 数量设置 `torchrun --nproc_per_node`。针对当前两张48GB GPU，默认
-每卡 batch size 为32、不做梯度累积；单机两卡的有效 batch 是
-`32 x 2 x 1 = 64`。每个进程完整持有冻结的 SUV/Wan 模型，但 DDP 只同步
+单机八卡高吞吐训练（推荐，当前正式配置）：
+
+```bash
+GPUS=0,1,2,3,4,5,6,7 bash scripts/suv_itae/train.sh
+```
+
+脚本按 `GPUS` 数量设置 `torchrun --nproc_per_node`。默认每卡 batch size 为32、
+不做梯度累积，因此八卡有效 batch 是：
+
+```text
+32 samples/GPU x 8 GPUs x 1 accumulation = 256 samples/optimizer step
+```
+
+训练启动后可在 `output/suv_itae/navsim_trainval/resolved_config.json` 的
+`runtime` 字段核对 `world_size=8`、`per_gpu_batch_size=32` 和
+`global_micro_batch_size=256`。每个进程完整持有冻结的 SUV/Wan 模型，但 DDP 只同步
 `requires_grad=True` 的 action expert 参数。
 
 实际 profiling 结果如下，吞吐是两卡全局吞吐：
@@ -172,9 +185,15 @@ profiling 会执行真实的 forward、backward、DDP all-reduce 和 AdamW step�
 运行 validation 或写入巨大的模型 checkpoint。
 
 batch 32 已达到 batch 64 吞吐的96.5%，但少占约8GiB reserved memory，因此选它
-作为速度、余量和稳定性的折中。相较原配置的全局有效 batch 16，配置同步采用线性
-学习率缩放到 `4e-5`，并把 max steps 从30,000缩至7,500、warmup/eval/save间隔
-同比缩短，保持总训练样本数和按样本计的调度位置基本不变。
+作为单卡速度、余量和稳定性的折中。在当前八卡正式运行中，每卡进程通过
+`nvidia-smi` 实测约占27.7GiB，仍保留了约20GiB显存余量。
+
+当前任务是从 step 15500 的既有权重续训，学习率继续使用 `4e-5`。全局 batch 从64
+改为256时，训练器首次恢复会打印 batch 变化警告，这是预期行为。这里不直接把
+学习率线性放大4倍到 `1.6e-4`：已有权重、恢复后的全新 AdamW moments，以及更大的
+batch 同时变化时，激进放大学习率会增加发散风险。相同 step 数下，新配置每步看到
+的样本数是原来的4倍；比较不同 run 时应按累计样本数或 epoch 对齐，而不是只按 step
+对齐。
 
 ### 两机训练
 
@@ -195,9 +214,11 @@ NNODES=2 NODE_RANK=1 MASTER_ADDR=10.0.0.1 MASTER_PORT=29500 \
 GPUS=0,1 bash scripts/suv_itae/train.sh
 ```
 
-默认配置按两卡调优。如果四张卡仍希望维持全局 batch 64，应增加
-`--batch-size 16`；否则每卡32会得到全局 batch 128，需要重新调整学习率和训练步
-数。多机训练中只有 global rank 0 写 checkpoint，所有 rank 在验证/保存边界同步。
+默认配置现在采用每卡 batch 32：两卡、四卡、八卡的全局 batch 分别是64、128、
+256。如果为了复现实验而必须维持全局 batch 64，四卡应指定 `--batch-size 16`，八卡
+应指定 `--batch-size 8`；这不是当前追求吞吐的正式设置。恢复 checkpoint 时如果检测
+到全局 batch 发生变化，训练器会打印明确警告。多机训练中只有 global rank 0 写
+checkpoint，所有 rank 在验证/保存边界同步。
 
 ### 48GB 显存建议
 
@@ -321,6 +342,19 @@ GPUS=0,1 bash scripts/suv_itae/train.sh \
 - `qualitative/step_*`：TensorBoard 视频对应的 MP4 和指标 JSON；
 - `best.pt`：验证 flow loss 最优的轻量 adapter，不含 optimizer；
 - `last.pt`：最近 adapter、optimizer、scheduler 和训练步数，用于续训。
+
+`best.pt` 和 `last.pt` 现在都先写到同目录临时文件，完整写出后再原子替换目标；
+因此在保存期间按 Ctrl-C 不会再把上一份有效断点截成0字节。如果历史 `last.pt`
+已经为空或损坏，自动续训会回退到 `best.pt`，恢复模型、normalizer、step 和学习率
+调度位置，并重新初始化 AdamW moments。也可以只修复断点而不训练：
+
+```bash
+GPUS=0,1,2,3,4,5,6,7 bash scripts/suv_itae/train.sh \
+  --batch-size 32 --recover-checkpoint-only
+```
+
+adapter-only 恢复无法重建已经丢失的 AdamW moments；日志会明确打印
+`adapter weights with fresh AdamW state`，不应把它描述成完全无损恢复。
 
 adapter 不复制 12GB 原始 SUV video expert；评测时必须同时保留原始
 `suv_navsim.pt`。`best.pt` 的选择依据是归一化 action-token flow loss，最终模型
